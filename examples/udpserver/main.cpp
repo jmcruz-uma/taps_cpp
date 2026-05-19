@@ -52,7 +52,8 @@ int main() {
             std::print("Message received: {}\n", received_msg);
             
             // Enviar respuesta
-            auto response = taps::make_message("Server received: " + received_msg);
+            std::string response_str = "Server received: " + received_msg;
+            auto response = taps::make_message(response_str);
             auto send_result = co_await conn->send(std::move(response));
             if (send_result) {
                 std::print("UDP response sent!\n");

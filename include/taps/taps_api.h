@@ -269,19 +269,37 @@ private:
 
 class Message {
 public:
+    // Owning: Message takes ownership of the vector. Required by the receive path.
     explicit Message(std::vector<std::uint8_t> data, MessageContext context = {})
-        : data_(std::move(data)), context_(std::move(context)) {}
-    
+        : owned_data_(std::move(data)), owning_(true), context_(std::move(context)) {}
+
+    // Non-owning: zero-copy send path (RFC 9623).
+    // Caller must keep the referenced data alive for the duration of any send() call.
     explicit Message(std::span<const std::uint8_t> data, MessageContext context = {})
-        : data_(data.begin(), data.end()), context_(std::move(context)) {}
-    
-    const std::vector<std::uint8_t>& data() const noexcept { return data_; }
+        : span_view_(data), owning_(false), context_(std::move(context)) {}
+
+    bool is_owning() const noexcept { return owning_; }
+
+    // Valid only when is_owning() == true.
+    const std::vector<std::uint8_t>& data() const noexcept { return owned_data_; }
+
+    // Valid only when is_owning() == false.
+    std::span<const std::uint8_t> view() const noexcept { return span_view_; }
+
+    // Returns a view of the payload regardless of ownership variant.
+    std::span<const std::uint8_t> as_span() const noexcept {
+        if (owning_) return {owned_data_.data(), owned_data_.size()};
+        return span_view_;
+    }
+
     const MessageContext& context() const noexcept { return context_; }
     void set_context(MessageContext context) { context_ = std::move(context); }
-    std::size_t length() const noexcept { return data_.size(); }
+    std::size_t length() const noexcept { return as_span().size(); }
 
 private:
-    std::vector<std::uint8_t> data_;
+    std::vector<std::uint8_t> owned_data_;
+    std::span<const std::uint8_t> span_view_;
+    bool owning_;
     MessageContext context_;
 };
 
@@ -306,7 +324,8 @@ class NoOpFramer : public MessageFramer {
 public:
     std::size_t frame_message(const Message& msg,
                               std::vector<std::uint8_t>& out_buffer) override {
-        out_buffer.assign(msg.data().begin(), msg.data().end());
+        auto s = msg.as_span();
+        out_buffer.assign(s.begin(), s.end());
         return out_buffer.size();
     }
     
@@ -608,16 +627,27 @@ concept MessageLike = requires(T t) {
     { t.data() } -> std::convertible_to<std::span<const std::uint8_t>>;
 };
 
-// Helper to create messages from various types
+// Non-owning helpers — caller must keep the source data alive through send().
 template<std::ranges::contiguous_range R>
     requires std::same_as<std::ranges::range_value_t<R>, std::uint8_t>
 Message make_message(R&& data, MessageContext context = {}) {
-    return Message(std::vector<std::uint8_t>(std::ranges::begin(data), std::ranges::end(data)), 
+    return Message(std::span<const std::uint8_t>(std::ranges::data(data), std::ranges::size(data)),
                    std::move(context));
 }
 
 inline Message make_message(std::string_view text, MessageContext context = {}) {
-    return Message(std::vector<std::uint8_t>(text.begin(), text.end()), std::move(context));
+    return Message(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(text.data()), text.size()),
+        std::move(context));
+}
+
+// Explicit non-owning factory aliases for clarity at call sites.
+inline Message make_message_view(std::span<const std::uint8_t> data, MessageContext context = {}) {
+    return Message(data, std::move(context));
+}
+
+inline Message make_message_view(std::string_view text, MessageContext context = {}) {
+    return make_message(text, std::move(context));
 }
 
 } // namespace taps

@@ -45,10 +45,13 @@ namespace taps {
                 framer_->frame_message(message, send_buffer_);
                 co_await asio::async_write(socket_, 
                     asio::buffer(send_buffer_), asio::use_awaitable);
-            } else {
-                const auto& data = message.data();
+            } else if (message.is_owning()) {
                 co_await asio::async_write(socket_,
-                    asio::buffer(data), asio::use_awaitable);
+                    asio::buffer(message.data()), asio::use_awaitable);
+            } else {
+                auto s = message.view();
+                co_await asio::async_write(socket_,
+                    asio::buffer(s.data(), s.size()), asio::use_awaitable);
             }
             
             co_return std::expected<void, TAPSError>{std::in_place};

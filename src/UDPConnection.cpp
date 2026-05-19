@@ -33,8 +33,10 @@ PassiveUDPConnection::send(const Message& message) {
         std::vector<uint8_t> data;
         if (framer_)
             framer_->frame_message(message, data);
-        else
-            data.assign(message.data().begin(), message.data().end());
+        else {
+            auto s = message.as_span();
+            data.assign(s.begin(), s.end());
+        }
 
         co_await socket_.async_send_to(
             asio::buffer(data),
@@ -121,7 +123,8 @@ asio::awaitable<Result<void>> ActiveUDPConnection::send(const Message& message) 
         if (framer_) {
             framer_->frame_message(message, data_to_send);
         } else {
-            data_to_send.assign(message.data().begin(), message.data().end());
+            auto s = message.as_span();
+            data_to_send.assign(s.begin(), s.end());
         }
 
         auto bytes_sent = co_await socket_.async_send_to(
