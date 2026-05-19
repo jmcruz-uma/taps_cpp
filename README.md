@@ -180,4 +180,4 @@ This project is licensed under the MIT License — see [LICENSE](LICENSE) for de
 
 ## Acknowledgements
 
-Special thanks to Jose Carlos Sequera-Montes y Jose Antonio García-Montañéz for their contributions to the project and for their support during its development.
+Special thanks to Jose Carlos Sequera-Montes and Jose Antonio García-Montañéz for their contributions to the project and for their support during its development.
