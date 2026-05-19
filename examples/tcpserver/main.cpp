@@ -54,7 +54,7 @@ int main() {
 
                 // Responder al cliente
                 std::string response = "Mensaje recibido: " + received_msg;
-                auto response_message = taps::make_message(response);
+                auto response_message = taps::make_message_view(response);
                 auto send_result = co_await conn->send(std::move(response_message));
 
                 if (!send_result) {

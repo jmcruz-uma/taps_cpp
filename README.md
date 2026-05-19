@@ -1,4 +1,4 @@
-# TAPS — Transport Services API for C++
+# TAPS: Transport Services API for C++
 
 A C++ implementation of the IETF Transport Services (TAPS) architecture, as described in [RFC 9621](https://www.rfc-editor.org/rfc/rfc9621) and related RFCs. TAPS abstracts the underlying transport protocol (TCP, UDP, …) behind a unified, property-driven API built on top of ASIO standalone coroutines.
 
@@ -105,7 +105,7 @@ int main() {
         if (!conn_result) { co_return; }
         auto& conn = *conn_result;
 
-        co_await conn->send(taps::make_message("Hello, TAPS!"));
+        co_await conn->send(taps::make_message_view("Hello, TAPS!"));
         auto msg = co_await conn->receive();
         co_await conn->close();
     };
@@ -141,7 +141,7 @@ int main() {
             auto conn_result = co_await listener->accept();
             auto& conn = *conn_result;
             auto msg = co_await conn->receive();
-            co_await conn->send(taps::make_message("Echo!"));
+            co_await conn->send(taps::make_message_view("Echo!"));
             co_await conn->close();
         }
     };

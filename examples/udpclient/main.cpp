@@ -30,7 +30,7 @@ auto udp_test = [&]() -> asio::awaitable<void> {
     auto& conn = *conn_result;
     
     // Enviar datagram
-    auto message = taps::make_message("Hello UDP from TAPS!");
+    auto message = taps::make_message_view("Hello UDP from TAPS!");
     auto send_result = co_await conn->send(std::move(message));
     
     if (send_result) {

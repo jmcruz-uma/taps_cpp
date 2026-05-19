@@ -627,7 +627,7 @@ concept MessageLike = requires(T t) {
     { t.data() } -> std::convertible_to<std::span<const std::uint8_t>>;
 };
 
-// Non-owning helpers — caller must keep the source data alive through send().
+// Non-owning factory for binary data — caller must keep the source alive through send().
 template<std::ranges::contiguous_range R>
     requires std::same_as<std::ranges::range_value_t<R>, std::uint8_t>
 Message make_message(R&& data, MessageContext context = {}) {
@@ -635,19 +635,15 @@ Message make_message(R&& data, MessageContext context = {}) {
                    std::move(context));
 }
 
-inline Message make_message(std::string_view text, MessageContext context = {}) {
-    return Message(std::span<const std::uint8_t>(
-        reinterpret_cast<const std::uint8_t*>(text.data()), text.size()),
-        std::move(context));
-}
-
-// Explicit non-owning factory aliases for clarity at call sites.
+// Explicit non-owning aliases. The _view suffix signals that the caller owns the data.
 inline Message make_message_view(std::span<const std::uint8_t> data, MessageContext context = {}) {
     return Message(data, std::move(context));
 }
 
 inline Message make_message_view(std::string_view text, MessageContext context = {}) {
-    return make_message(text, std::move(context));
+    return Message(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(text.data()), text.size()),
+        std::move(context));
 }
 
 } // namespace taps

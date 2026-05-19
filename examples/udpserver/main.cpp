@@ -53,7 +53,7 @@ int main() {
             
             // Enviar respuesta
             std::string response_str = "Server received: " + received_msg;
-            auto response = taps::make_message(response_str);
+            auto response = taps::make_message_view(response_str);
             auto send_result = co_await conn->send(std::move(response));
             if (send_result) {
                 std::print("UDP response sent!\n");

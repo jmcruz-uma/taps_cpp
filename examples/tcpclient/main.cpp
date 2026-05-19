@@ -29,7 +29,7 @@ int main(){
         
         auto & conn = *init_result;
         // Enviar mensaje
-        auto message = taps::make_message("Hola mundo (en TAPS)!\n");
+        auto message = taps::make_message_view("Hola mundo (en TAPS)!\n");
         auto send_result = co_await conn->send(std::move(message));
         
         if (!send_result) {
