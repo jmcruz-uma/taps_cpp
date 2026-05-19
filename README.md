@@ -1,6 +1,6 @@
 # TAPS: Transport Services API for C++
 
-A C++ implementation of the IETF Transport Services (TAPS) architecture, as described in [RFC 9621](https://www.rfc-editor.org/rfc/rfc9621) and related RFCs. TAPS abstracts the underlying transport protocol (TCP, UDP, …) behind a unified, property-driven API built on top of ASIO standalone coroutines.
+A research-oriented C++ implementation of the IETF Transport Services (TAPS) architecture, as described in [RFC 9621](https://www.rfc-editor.org/rfc/rfc9621) and related RFCs. TAPS abstracts the underlying transport protocol (TCP, UDP, …) behind a unified, property-driven API built on top of Asio standalone coroutines.
 
 ## Features
 
@@ -8,22 +8,21 @@ A C++ implementation of the IETF Transport Services (TAPS) architecture, as desc
 - **Transport property selection** — declare requirements such as reliability, ordering, and message boundaries; the library picks the appropriate protocol.
 - **Happy Eyeballs racing** — concurrent connection attempts across multiple endpoints for faster establishment.
 - **Pluggable message framers** — `NoOpFramer`, `LengthPrefixedFramer`, and `DelimiterFramer` included; implement `MessageFramer` to add your own.
-- **C++23 coroutines** — async operations are expressed as `co_await` expressions on `asio::awaitable<>`.
-- **Static library** — built as `libtaps.a`; link it into your application.
+- **C++20 coroutines** — async operations are expressed as `co_await` expressions on `asio::awaitable<>`.
 
 ## Requirements
 
 | Dependency | Version |
 |---|---|
-| C++ compiler | GCC 14+ (C++23 required) |
+| C++ compiler | GCC 14+ (C++23 required, but only because we are using std::expected) |
 | CMake | 3.10+ |
-| ASIO standalone | any recent version (header-only) |
+| Asio standalone | any recent version (header-only) |
 
-ASIO standalone is available at <https://think-async.com/Asio/> or as part of the Boost distribution.
+Asio standalone is available at <https://think-async.com/Asio/> or as part of the Boost distribution.
 
 ## Building
 
-1. **Set the ASIO path** — open [CMakeLists.txt](CMakeLists.txt) and update `ASIO_INCLUDE_DIR` to point to the directory that contains `asio.hpp`:
+1. **Set the Asio path** — open [CMakeLists.txt](CMakeLists.txt) and update `ASIO_INCLUDE_DIR` to point to the directory that contains `asio.hpp`:
 
    ```cmake
    set(ASIO_INCLUDE_DIR "/path/to/asio/include" ...)
@@ -178,3 +177,7 @@ Assign a framer to a connection with `conn->set_framer(std::make_unique<MyFramer
 ## License
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
+
+## Acknowledgements
+
+Special thanks to Jose Carlos Sequera-Montes y Jose Antonio García-Montañéz and Y for their contributions to the project and for their support during its development.
