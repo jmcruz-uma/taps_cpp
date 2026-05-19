@@ -1,0 +1,55 @@
+# =========================
+# BUILD
+# =========================
+build/
+bin/
+out/
+
+# =========================
+# COMPILED FILES
+# =========================
+*.o
+*.obj
+*.so
+*.a
+*.lib
+*.dll
+*.exe
+*.out
+
+# =========================
+# CMAKE
+# =========================
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# =========================
+# LOGS AND TEMPORARY FILES
+# =========================
+*.log
+*.tmp
+*.swp
+
+# =========================
+# IDEs / EDITORS
+# =========================
+
+# VSCode
+.vscode/
+
+# CLion / JetBrains
+.idea/
+
+# Visual Studio
+.vs/
+*.vcxproj*
+*.sln
+
+# =========================
+# SYSTEM
+# =========================
+.DS_Store
+Thumbs.db
