@@ -13,13 +13,13 @@ namespace taps {
 // ============================================================================
 
     TCPConnection::TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint)
-        : socket_(ctx), receive_buffer_(8192){
+        : socket_(ctx), receive_buffer_(65536){
             remote_endpoint_ = endpoint;
     }
     
     // Constructor for accepted connections
     TCPConnection::TCPConnection(asio::ip::tcp::socket socket)
-        : socket_(std::move(socket)), receive_buffer_(8192) {
+        : socket_(std::move(socket)), receive_buffer_(65536) {
         state_ = ConnectionState::ESTABLISHED;
         
         // Cache endpoints
@@ -209,9 +209,10 @@ namespace taps {
                                               "Connection closed by peer"});
         }
         
-        std::vector<std::uint8_t> data(receive_buffer_.begin(), 
-                                     receive_buffer_.begin() + bytes_read);
-        co_return Message(std::move(data));
+        receive_buffer_.resize(bytes_read);
+        auto owned = std::move(receive_buffer_);
+        receive_buffer_.resize(65536);
+        co_return Message(std::move(owned));
     }
 
 
