@@ -6,31 +6,50 @@ project(TAPS_Project VERSION 1.0.0 LANGUAGES CXX)
 
 # Estándar de C++
 set(CMAKE_CXX_STANDARD 23)
-#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++23")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Configuraciones de compilación con flag ASIO_STANDALONE
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra -DASIO_STANDALONE")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -DASIO_STANDALONE")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra -Wpedantic -DASIO_STANDALONE")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -DASIO_STANDALONE")
 
-# CONFIGURACIÓN DE ASIO STANDALONE
-# Ruta específica del usuario ASIO
-set(ASIO_INCLUDE_DIR "/home/alumno/libs/asio/asio/include" CACHE PATH "Path to ASIO standalone headers")
+# =============================================================================
+# ASIO standalone configuration
+# =============================================================================
+# Option 1 (recommended): FetchContent — downloads Asio automatically
+include(FetchContent)
+FetchContent_Declare(
+    asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+    GIT_TAG        asio-1-32-0
+    SOURCE_SUBDIR  asio
+)
+FetchContent_MakeAvailable(asio)
 
-# Opción alternativa: Variable de entorno (más flexible para otros usuarios)
-# set(ASIO_INCLUDE_DIR "$ENV{ASIO_ROOT}/include" CACHE PATH "Path to ASIO standalone headers")
+# Option 2: Set ASIO_INCLUDE_DIR manually if you have Asio installed locally
+# Uncomment and set the path:
+# set(ASIO_INCLUDE_DIR "/usr/local/include" CACHE PATH "Path to ASIO standalone headers")
+# If neither FetchContent nor ASIO_INCLUDE_DIR works, the FetchContent above
+# will download and configure Asio automatically.
 
-# Verificar que ASIO existe
-if(NOT EXISTS "${ASIO_INCLUDE_DIR}/asio.hpp")
-    message(FATAL_ERROR "ASIO not found at ${ASIO_INCLUDE_DIR}. Please set ASIO_INCLUDE_DIR to the correct path.")
+# Asio header-only: we only need the include path
+if(NOT asio_SOURCE_DIR)
+    # Fallback: use ASIO_INCLUDE_DIR if set
+    if(NOT ASIO_INCLUDE_DIR OR NOT EXISTS "${ASIO_INCLUDE_DIR}/asio.hpp")
+        message(FATAL_ERROR 
+            "Asio not found. Either:\n"
+            "  1. Let FetchContent download it (default)\n"
+            "  2. Set -DASIO_INCLUDE_DIR=/path/to/asio/include\n"
+            "  3. Install Asio: git clone https://github.com/chriskohlhoff/asio.git")
+    endif()
+    include_directories(${ASIO_INCLUDE_DIR})
+else()
+    # FetchContent: asio headers are in asio/include (standalone layout)
+    include_directories(${asio_SOURCE_DIR}/asio/include)
 endif()
 
-message(STATUS "Using ASIO from: ${ASIO_INCLUDE_DIR}")
-
-# Directorio donde CMake buscará los headers (incluir ASIO)
+# Project headers
 include_directories(${CMAKE_SOURCE_DIR}/include)
-include_directories(${ASIO_INCLUDE_DIR})
 
 # Agregar subdirectorios
 add_subdirectory(src)        # Biblioteca TAPS
