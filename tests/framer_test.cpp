@@ -1,8 +1,8 @@
-// Tests for MessageFramer v2 (taps::framing): fr::ReceiveCursor over a BlockChain and
-// fr::LengthPrefixedFramer::parse / write_header. Nothing here is wired into the
-// library's receive path yet.
+// Tests for MessageFramer (API v2): ReceiveCursor over a BlockChain and
+// LengthPrefixedFramer::parse / write_header.
 
 #include "taps/message_framer.h"
+#include "taps/taps_api.h"
 
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
@@ -15,7 +15,6 @@
 #include <vector>
 
 using namespace taps;
-namespace fr = taps::framing;   // taps:: still carries the v1 framer this commit
 
 static int g_failures = 0;
 
@@ -62,7 +61,7 @@ static void test_cursor_copy_out_across_blocks() {
     fill_chain(chain, pool, data, 4);
     CHECK(chain.block_count() == 5);
 
-    fr::ReceiveCursor cur(chain);
+    ReceiveCursor cur(chain);
     CHECK(cur.size() == 20);
 
     std::byte got[7];
@@ -78,7 +77,7 @@ static void test_cursor_try_contiguous() {
     BlockChain chain;
     fill_chain(chain, pool, data, 8);
 
-    fr::ReceiveCursor cur(chain);
+    ReceiveCursor cur(chain);
     auto within = cur.try_contiguous(2, 4);              // inside block 0
     CHECK(within.has_value());
     CHECK(std::to_integer<int>((*within)[0]) == 2);
@@ -94,34 +93,34 @@ static void test_cursor_try_contiguous() {
 
 static void test_lpf_parse_need_more() {
     BlockPool pool(64);
-    fr::LengthPrefixedFramer f;  // 4-byte big-endian
+    LengthPrefixedFramer f;  // 4-byte big-endian
 
     {   // empty
         BlockChain c;
-        auto r = f.parse(fr::ReceiveCursor(c), false);
-        CHECK(r.action == fr::ParseResult::Action::NeedMore);
+        auto r = f.parse(ReceiveCursor(c), false);
+        CHECK(r.action == ParseResult::Action::NeedMore);
         CHECK(r.min_bytes_needed == 4);
     }
     {   // 3 bytes: still just the prefix
         std::vector<std::byte> d{std::byte{0}, std::byte{0}, std::byte{0}};
         BlockChain c; fill_chain(c, pool, d, 64);
-        auto r = f.parse(fr::ReceiveCursor(c), false);
-        CHECK(r.action == fr::ParseResult::Action::NeedMore);
+        auto r = f.parse(ReceiveCursor(c), false);
+        CHECK(r.action == ParseResult::Action::NeedMore);
         CHECK(r.min_bytes_needed == 4);
     }
     {   // prefix says 10, only 6 body bytes present
         auto rec = record(10, 100);
         rec.resize(4 + 6);
         BlockChain c; fill_chain(c, pool, rec, 64);
-        auto r = f.parse(fr::ReceiveCursor(c), false);
-        CHECK(r.action == fr::ParseResult::Action::NeedMore);
+        auto r = f.parse(ReceiveCursor(c), false);
+        CHECK(r.action == ParseResult::Action::NeedMore);
         CHECK(r.min_bytes_needed == 14);
     }
 }
 
 static void test_lpf_parse_emit_and_second_record() {
     BlockPool pool(/*block_size=*/3);   // tiny: prefixes and bodies straddle blocks
-    fr::LengthPrefixedFramer f;
+    LengthPrefixedFramer f;
 
     auto r1 = record(10, 0);
     auto r2 = record(5, 200);
@@ -132,8 +131,8 @@ static void test_lpf_parse_emit_and_second_record() {
     BlockChain chain;
     fill_chain(chain, pool, both, 3);
 
-    auto a = f.parse(fr::ReceiveCursor(chain), false);
-    CHECK(a.action == fr::ParseResult::Action::Emit);
+    auto a = f.parse(ReceiveCursor(chain), false);
+    CHECK(a.action == ParseResult::Action::Emit);
     CHECK(a.discard_before == 4);
     CHECK(a.deliver == 10);
     CHECK(a.end_of_message);
@@ -142,20 +141,20 @@ static void test_lpf_parse_emit_and_second_record() {
     chain.consume_front(a.discard_before + a.deliver);
     CHECK(chain.size() == r2.size());
 
-    auto b = f.parse(fr::ReceiveCursor(chain), false);
-    CHECK(b.action == fr::ParseResult::Action::Emit);
+    auto b = f.parse(ReceiveCursor(chain), false);
+    CHECK(b.action == ParseResult::Action::Emit);
     CHECK(b.discard_before == 4);
     CHECK(b.deliver == 5);
 
     chain.consume_front(b.discard_before + b.deliver);
     CHECK(chain.empty());
-    auto c = f.parse(fr::ReceiveCursor(chain), true);
-    CHECK(c.action == fr::ParseResult::Action::NeedMore);
+    auto c = f.parse(ReceiveCursor(chain), true);
+    CHECK(c.action == ParseResult::Action::NeedMore);
 }
 
 static void test_lpf_write_header_roundtrip() {
-    fr::LengthPrefixedFramer be(4, std::endian::big);
-    fr::LengthPrefixedFramer le(4, std::endian::little);
+    LengthPrefixedFramer be(4, std::endian::big);
+    LengthPrefixedFramer le(4, std::endian::little);
 
     Message msg(std::vector<std::uint8_t>(513));  // size() == 513 == 0x0201
 
@@ -177,8 +176,8 @@ static void test_lpf_write_header_roundtrip() {
     std::vector<std::byte> framed(h, h + 4);
     framed.resize(4 + 513);
     BlockChain c; fill_chain(c, pool, framed, 64);
-    auto r = le.parse(fr::ReceiveCursor(c), false);
-    CHECK(r.action == fr::ParseResult::Action::Emit);
+    auto r = le.parse(ReceiveCursor(c), false);
+    CHECK(r.action == ParseResult::Action::Emit);
     CHECK(r.deliver == 513);
 }
 

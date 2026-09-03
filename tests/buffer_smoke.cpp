@@ -178,6 +178,43 @@ static void test_chain_consume_front() {
     CHECK(pool.live_blocks() == 0);
 }
 
+static void test_chain_first_slice() {
+    BlockPool pool(/*block_size=*/16, /*max_free_blocks=*/8);
+    BlockChain chain;
+    chain.append(make_filled(pool, 16, 0));      // stream [0,16)
+    chain.append(make_filled(pool, 16, 16));     // stream [16,32)
+    chain.append(make_filled(pool, 16, 32));     // stream [32,48)
+    CHECK(pool.live_blocks() == 3);
+
+    // A slice straddling the second block: shares blocks, does not consume.
+    BlockChain slice = chain.first(24);
+    CHECK(slice.size() == 24);
+    CHECK(chain.size() == 48);                   // source untouched
+    CHECK(slice.block_count() == 2);             // full block 0 + 8 bytes of block 1
+    CHECK(pool.live_blocks() == 3);              // shared, no new blocks
+
+    std::vector<std::byte> out(24);
+    slice.copy_to(out);
+    for (std::size_t i = 0; i < 24; ++i)
+        CHECK(out[i] == static_cast<std::byte>(static_cast<std::uint8_t>(i)));
+
+    // Now consume the same 24 bytes from the source; block 0 returns to the pool
+    // but block 1 stays live because the slice still references it.
+    chain.consume_front(24);
+    CHECK(chain.size() == 24);
+    CHECK(pool.live_blocks() == 3);
+    CHECK(pool.free_blocks() == 0);
+
+    // Dropping the slice releases block 0 (its only remaining ref).
+    slice = BlockChain{};
+    CHECK(pool.live_blocks() == 2);
+    CHECK(pool.free_blocks() == 1);
+
+    // first() clamps to size().
+    BlockChain all = chain.first(1000);
+    CHECK(all.size() == 24);
+}
+
 int main() {
     test_pool_acquire_release();
     test_pool_recycles_same_storage();
@@ -186,6 +223,7 @@ int main() {
     test_live_cap_backpressure();
     test_chain_append_and_linearize();
     test_chain_consume_front();
+    test_chain_first_slice();
 
     if (g_failures == 0) {
         std::printf("buffer_smoke: OK\n");

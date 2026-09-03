@@ -1,9 +1,13 @@
 #include "taps/taps_api.h"
 #include "taps/mailbox.h"
+#include "taps/message_framer.h"
 #include <asio/co_spawn.hpp>
 #include <asio/use_awaitable.hpp>
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cassert>
+#include <cstddef>
 
 namespace taps {
 
@@ -30,18 +34,20 @@ PassiveUDPConnection::~PassiveUDPConnection() {
 asio::awaitable<Result<void>>
 PassiveUDPConnection::send(const Message& message) {
     try {
-        std::vector<uint8_t> data;
-        if (framer_)
-            framer_->frame_message(message, data);
-        else {
-            auto s = message.as_span();
-            data.assign(s.begin(), s.end());
+        const auto body = message.as_span();
+        if (framer_) {
+            std::array<std::byte, 64> hdr;
+            assert(framer_->max_header_size() <= hdr.size());
+            const std::size_t hn = framer_->write_header(message, hdr);
+            const std::array<asio::const_buffer, 2> iov{
+                asio::buffer(hdr.data(), hn),
+                asio::buffer(body.data(), body.size())};
+            co_await socket_.async_send_to(iov, remote_endpoint_, asio::use_awaitable);
+        } else {
+            co_await socket_.async_send_to(
+                asio::buffer(body.data(), body.size()), remote_endpoint_,
+                asio::use_awaitable);
         }
-
-        co_await socket_.async_send_to(
-            asio::buffer(data),
-            remote_endpoint_,
-            asio::use_awaitable);
 
         co_return Result<void>{std::in_place};
     } catch (const std::exception& e) {
@@ -119,21 +125,21 @@ asio::awaitable<Result<void>> ActiveUDPConnection::send(const Message& message) 
             state_ = ConnectionState::ESTABLISHED;
         }
         
-        std::vector<std::uint8_t> data_to_send;
+        const auto body = message.as_span();
+        std::array<std::byte, 64> hdr;
+        std::size_t hn = 0;
         if (framer_) {
-            framer_->frame_message(message, data_to_send);
-        } else {
-            auto s = message.as_span();
-            data_to_send.assign(s.begin(), s.end());
+            assert(framer_->max_header_size() <= hdr.size());
+            hn = framer_->write_header(message, hdr);
         }
+        const std::array<asio::const_buffer, 2> iov{
+            asio::buffer(hdr.data(), hn),
+            asio::buffer(body.data(), body.size())};
 
-        auto bytes_sent = co_await socket_.async_send_to(
-            asio::buffer(data_to_send),
-            remote_endpoint_,
-            asio::use_awaitable
-        );
+        const std::size_t bytes_sent = co_await socket_.async_send_to(
+            iov, remote_endpoint_, asio::use_awaitable);
 
-        if (bytes_sent != data_to_send.size()) {
+        if (bytes_sent != hn + body.size()) {
             co_return std::unexpected(TAPSError(ErrorType::PROTOCOL_ERROR,
                                                 "Partial send occurred"));
         }

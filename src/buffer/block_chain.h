@@ -40,6 +40,11 @@ public:
     // block has its begin advanced in place.
     void consume_front(std::size_t n);
 
+    // A new chain over the first `len` bytes (clamped to size()), sharing the
+    // underlying blocks by reference count. Does not consume from *this.
+    // RFC 9623 section 6 DeliverAndAdvanceReceiveCursor.
+    BlockChain first(std::size_t len) const;
+
     // Copies the whole chain into `out` (out.size() must be >= size()).
     // Returns the number of bytes written.
     std::size_t copy_to(std::span<std::byte> out) const;

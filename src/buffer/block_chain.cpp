@@ -34,6 +34,21 @@ void BlockChain::consume_front(std::size_t n) {
         blocks_.pop_front();
 }
 
+BlockChain BlockChain::first(std::size_t len) const {
+    BlockChain out;
+    len = std::min(len, size_);
+    for (const BlockRef& r : blocks_) {
+        if (len == 0)
+            break;
+        const std::size_t take = std::min(r.size(), len);
+        BlockRef piece = r;  // shares the block by reference count
+        piece.set_range(r.begin_offset(), r.begin_offset() + take);
+        out.append(std::move(piece));
+        len -= take;
+    }
+    return out;
+}
+
 std::size_t BlockChain::copy_to(std::span<std::byte> out) const {
     assert(out.size() >= size_);
     std::size_t off = 0;

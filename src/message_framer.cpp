@@ -1,12 +1,13 @@
 #include "taps/message_framer.h"
 
+#include "taps/taps_api.h"        // taps::Message (complete type for write_header)
 #include "buffer/block_chain.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 
-namespace taps::framing {
+namespace taps {
 
 // ----------------------------------------------------------------------------
 // ReceiveCursor
@@ -103,4 +104,4 @@ std::size_t LengthPrefixedFramer::write_header(const Message& msg,
     return length_field_size_;
 }
 
-}  // namespace taps::framing
+}  // namespace taps

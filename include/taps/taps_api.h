@@ -7,6 +7,7 @@
 #include <asio/ip/udp.hpp>
 #include <asio/experimental/channel.hpp>
 
+#include "taps/message_framer.h"   // taps::MessageFramer (API v2), ReceiveCursor, ParseResult
 
 #include <string>
 #include <vector>
@@ -336,90 +337,8 @@ private:
 };
 
 // ============================================================================
-// Message Framing
+// Message Framing — see taps/message_framer.h (MessageFramer API v2, RFC 9623 §6)
 // ============================================================================
-
-class MessageFramer {
-public:
-    virtual ~MessageFramer() = default;
-    
-    virtual std::size_t frame_message(const Message& msg,
-                                     std::vector<std::uint8_t>& out_buffer) = 0;
-    virtual std::size_t parse_stream(std::span<const std::uint8_t> buffer,
-                                     std::vector<Message>& out_messages) = 0;
-    virtual std::size_t get_required_bytes() const = 0;
-    virtual bool has_complete_message(std::span<const std::uint8_t> buffer) const = 0;
-    virtual void reset() = 0;
-};
-
-class NoOpFramer : public MessageFramer {
-public:
-    std::size_t frame_message(const Message& msg,
-                              std::vector<std::uint8_t>& out_buffer) override {
-        auto s = msg.as_span();
-        out_buffer.assign(s.begin(), s.end());
-        return out_buffer.size();
-    }
-    
-    std::size_t parse_stream(std::span<const std::uint8_t> buffer,
-                             std::vector<Message>& out_messages) override {
-        if (!buffer.empty()) {
-            out_messages.emplace_back(std::vector<std::uint8_t>(buffer.begin(), buffer.end()));
-            return buffer.size();
-        }
-        return 0;
-    }
-    
-    std::size_t get_required_bytes() const override { return 1; }
-    
-    bool has_complete_message(std::span<const std::uint8_t> buffer) const override {
-        return !buffer.empty();
-    }
-    
-    void reset() override {}
-};
-
-class LengthPrefixedFramer : public MessageFramer {
-public:
-    explicit LengthPrefixedFramer(std::size_t length_field_size = 4, 
-                                 std::endian byte_order = std::endian::big)
-        : length_field_size_(length_field_size), byte_order_(byte_order) {}
-    
-    std::size_t frame_message(const Message& msg,
-                              std::vector<std::uint8_t>& out_buffer) override;
-    std::size_t parse_stream(std::span<const std::uint8_t> buffer,
-                             std::vector<Message>& out_messages) override;
-    std::size_t get_required_bytes() const override { return length_field_size_; }
-    bool has_complete_message(std::span<const std::uint8_t> buffer) const override;
-    void reset() override;
-
-private:
-    std::size_t length_field_size_;
-    std::endian byte_order_;
-    std::size_t expected_message_length_ = 0;
-    bool length_read_ = false;
-};
-
-class DelimiterFramer : public MessageFramer {
-public:
-    explicit DelimiterFramer(std::vector<std::uint8_t> delimiter, 
-                           std::size_t max_message_size = 65536)
-        : delimiter_(std::move(delimiter)), max_message_size_(max_message_size) {}
-    
-    std::size_t frame_message(const Message& msg,
-                              std::vector<std::uint8_t>& out_buffer) override;
-    std::size_t parse_stream(std::span<const std::uint8_t> buffer,
-                             std::vector<Message>& out_messages) override;
-    std::size_t get_required_bytes() const override { return 1; }
-    bool has_complete_message(std::span<const std::uint8_t> buffer) const override;
-    void reset() override {}
-
-private:
-    std::vector<std::uint8_t> delimiter_;
-    std::size_t max_message_size_;
-    
-    std::size_t find_delimiter(std::span<const std::uint8_t> buffer) const;
-};
 
 // ============================================================================
 // Connection States
@@ -554,19 +473,16 @@ public:
 private:
     asio::ip::tcp::socket socket_;
     asio::ip::tcp::endpoint remote_endpoint_;
-    std::vector<std::uint8_t> receive_buffer_;
-    std::vector<std::uint8_t> send_buffer_;
 
     // Cached endpoints to avoid system calls
     std::optional<asio::ip::tcp::endpoint> cached_remote_endpoint_;
     std::optional<asio::ip::tcp::endpoint> cached_local_endpoint_;
 
-
-    // Receive buffer management for framing
-    std::vector<std::uint8_t> partial_frame_buffer_;
-
-    // Pool of fixed-size blocks for the no-framer receive path (mode D / mode C).
+    // Pool of fixed-size blocks for the receive path (framed and no-framer).
     std::unique_ptr<BlockPool> block_pool_;
+    // Bytes received but not yet parsed by the framer, behind the receive cursor.
+    std::unique_ptr<BlockChain> receive_chain_;
+    bool receive_eof_ = false;
 
     asio::awaitable<Result<Message>> receive_with_framing();
     asio::awaitable<Result<Message>> receive_without_framing();

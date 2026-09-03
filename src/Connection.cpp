@@ -2,21 +2,10 @@
 
 namespace taps {
 
+// Framing is applied on the wire by the transport-specific receive path; this
+// helper just wraps an already-decoded payload in an owning Message.
 Result<Message> Connection::make_message(std::vector<uint8_t>&& buffer) {
-    if (framer_) {
-        std::vector<Message> messages;
-        auto consumed = framer_->parse_stream(std::span(buffer), messages);
-        if (messages.empty()) {
-            return std::unexpected(TAPSError(
-                ErrorType::FRAMING_ERROR,
-                "No complete message in received data"
-            ));
-        }
-        (void)consumed;
-        return std::move(messages[0]);
-    } else {
-        return Message(std::move(buffer));
-    }
+    return Message(std::move(buffer));
 }
 
 }

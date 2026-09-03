@@ -1,5 +1,6 @@
 
 #include "taps/taps_api.h"
+#include "taps/message_framer.h"
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
 #include <asio/use_awaitable.hpp>
@@ -9,6 +10,9 @@
 #include <asio/read.hpp>
 #include <asio/write.hpp>
 #include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstddef>
 #include <memory>
 
 namespace taps {
@@ -18,14 +22,15 @@ namespace taps {
 // ============================================================================
 
     TCPConnection::TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint)
-        : socket_(ctx), receive_buffer_(65536), block_pool_(std::make_unique<BlockPool>()){
+        : socket_(ctx), block_pool_(std::make_unique<BlockPool>()),
+          receive_chain_(std::make_unique<BlockChain>()){
             remote_endpoint_ = endpoint;
     }
 
     // Constructor for accepted connections
     TCPConnection::TCPConnection(asio::ip::tcp::socket socket)
-        : socket_(std::move(socket)), receive_buffer_(65536),
-          block_pool_(std::make_unique<BlockPool>()) {
+        : socket_(std::move(socket)), block_pool_(std::make_unique<BlockPool>()),
+          receive_chain_(std::make_unique<BlockChain>()) {
         state_ = ConnectionState::ESTABLISHED;
         
         // Cache endpoints
@@ -50,10 +55,16 @@ namespace taps {
         
         try {
             if (framer_) {
-                send_buffer_.clear();
-                framer_->frame_message(message, send_buffer_);
-                co_await asio::async_write(socket_, 
-                    asio::buffer(send_buffer_), asio::use_awaitable);
+                // Gather-write: framing header (stack) + untouched payload, one
+                // async_write (writev under the hood). No payload copy.
+                std::array<std::byte, 64> hdr;
+                assert(framer_->max_header_size() <= hdr.size());
+                const std::size_t hn = framer_->write_header(message, hdr);
+                const auto body = message.as_span();
+                const std::array<asio::const_buffer, 2> iov{
+                    asio::buffer(hdr.data(), hn),
+                    asio::buffer(body.data(), body.size())};
+                co_await asio::async_write(socket_, iov, asio::use_awaitable);
             } else if (message.is_owning()) {
                 co_await asio::async_write(socket_,
                     asio::buffer(message.data()), asio::use_awaitable);
@@ -172,38 +183,46 @@ namespace taps {
 
     
     asio::awaitable<Result<Message>> TCPConnection::receive_with_framing() {
-        while (true) {
-            // Check if we have a complete message in buffer
-            if (!partial_frame_buffer_.empty()) {
-                if (framer_->has_complete_message(partial_frame_buffer_)) {
-                    std::vector<Message> messages;
-                    auto consumed = framer_->parse_stream(partial_frame_buffer_, messages);
-                    if (!messages.empty()) {
-                        auto message = std::move(messages.front());
-                        partial_frame_buffer_.erase(
-                            partial_frame_buffer_.begin(),
-                            partial_frame_buffer_.begin() + std::min(consumed, partial_frame_buffer_.size())
-                        );
-                        co_return std::move(message);
-                    }
-                }
+        // RFC 9623 Section 6: the framer parses records out of a receive cursor
+        // over the accumulated-but-unparsed bytes (receive_chain_). Each Emit is
+        // delivered as a refcounted slice of the chain — no payload copy. Leftover
+        // bytes of the next record stay in receive_chain_ for the following call.
+        for (;;) {
+            ParseResult pr = framer_->parse(ReceiveCursor(*receive_chain_), receive_eof_);
+
+            if (pr.action == ParseResult::Action::Emit) {
+                if (pr.discard_before > 0)
+                    receive_chain_->consume_front(pr.discard_before);
+                auto slice = std::make_shared<BlockChain>(receive_chain_->first(pr.deliver));
+                receive_chain_->consume_front(pr.deliver);
+                co_return Message(std::move(slice), MessageContext{}, pr.end_of_message);
             }
-            
-            // Need more data
-            auto bytes_read = co_await socket_.async_read_some(
-                asio::buffer(receive_buffer_), asio::use_awaitable);
-            
-            if (bytes_read == 0) {
-                // Connection closed by peer
+
+            // ParseResult::Action::NeedMore
+            if (receive_eof_) {
                 state_ = ConnectionState::CLOSED;
-                co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, 
-                                                  "Connection closed by peer"});
+                co_return Message(std::make_shared<BlockChain>(), MessageContext{},
+                                  /*end_of_message=*/true);
             }
-            
-            // Append to partial buffer
-            partial_frame_buffer_.insert(partial_frame_buffer_.end(),
-                                       receive_buffer_.begin(), 
-                                       receive_buffer_.begin() + bytes_read);
+
+            BlockRef block = block_pool_->acquire();
+            asio::error_code ec;
+            std::size_t n = co_await socket_.async_read_some(
+                asio::buffer(block.writable_data(), block.capacity_after_begin()),
+                asio::redirect_error(asio::use_awaitable, ec));
+
+            if (ec == asio::error::eof) {
+                receive_eof_ = true;
+                continue;
+            }
+            if (ec) {
+                state_ = ConnectionState::ERROR;
+                co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, ec.message()});
+            }
+            if (n > 0) {
+                block.set_range(0, n);
+                receive_chain_->append(std::move(block));
+            }
         }
     }
     

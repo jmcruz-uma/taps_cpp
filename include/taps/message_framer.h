@@ -1,19 +1,17 @@
 #pragma once
 
-// Message Framer — API v2 (RFC 9623 Section 6), receive side over the block chain.
-//
-// Introduced alongside the v1 taps::MessageFramer; a later commit removes v1 and
-// lifts these types from taps::framing into taps. Nothing in the library is wired
-// to this yet.
-
-#include "taps/taps_api.h"   // taps::Message, forward-declares taps::BlockChain
+// Message Framer — API v2 (RFC 9623 Section 6): a receive-side cursor over the
+// block chain plus a no-copy send-side header writer.
 
 #include <bit>
 #include <cstddef>
 #include <optional>
 #include <span>
 
-namespace taps::framing {
+namespace taps {
+
+class Message;      // taps_api.h
+class BlockChain;   // src/buffer/block_chain.h (private)
 
 // Read-only cursor over the received-but-unparsed bytes: a logically contiguous
 // view spread across the BlockChain's fixed-size blocks.
@@ -98,4 +96,4 @@ private:
     std::endian byte_order_;
 };
 
-}  // namespace taps::framing
+}  // namespace taps
