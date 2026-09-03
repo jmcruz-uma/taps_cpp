@@ -5,6 +5,7 @@
 #include <asio/detached.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/ip/udp.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/experimental/channel.hpp>
 
 #include "taps/message_framer.h"   // taps::MessageFramer (API v2), ReceiveCursor, ParseResult
@@ -12,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <list>
 #include <memory>
 #include <functional>
 #include <chrono>
@@ -573,14 +575,33 @@ public:
     asio::awaitable<Result<void>> stop() override;
 
 private:
+    // One live logical connection (one source endpoint) and its last-activity time.
+    struct Conn {
+        asio::ip::udp::endpoint             endpoint;
+        std::shared_ptr<Mailbox>            mailbox;
+        std::chrono::steady_clock::time_point last_active;
+    };
+
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
 
     asio::strand<asio::io_context::executor_type> strand_;
-    std::unordered_map<asio::ip::udp::endpoint, std::shared_ptr<Mailbox>> mailboxes_;
+
+    // LRU of live logical connections, most-recent-first; index_ maps a source
+    // endpoint to its node. Both are touched only on strand_.
+    std::list<Conn> lru_;
+    std::unordered_map<asio::ip::udp::endpoint, std::list<Conn>::iterator> index_;
+
     asio::experimental::channel<void(std::error_code, std::unique_ptr<PassiveUDPConnection>)> accept_channel_;
     // One shared pool for the single receive loop; datagrams are one block each.
     std::unique_ptr<BlockPool> block_pool_;
+    asio::steady_timer sweep_timer_;
+
+    // Demux helpers, all run on strand_.
+    std::shared_ptr<Mailbox> touch_or_create(const asio::ip::udp::endpoint& sender,
+                                             bool& is_new);
+    void evict(std::list<Conn>::iterator it);
+    asio::awaitable<void> sweep_loop();
 };
 
 // ============================================================================
