@@ -309,6 +309,11 @@ public:
     // Valid only for the span variant (non-owning send path).
     std::span<const std::uint8_t> view() const noexcept { return span_view_; }
 
+    // The block chain backing this Message, or nullptr for the vector / span
+    // variants. Used by the transport send path for gather-write; BlockChain is
+    // an implementation type, opaque to applications.
+    const BlockChain* block_chain() const noexcept { return chain_.get(); }
+
     // Contiguous byte view regardless of variant. Cheap for vector / span; forces
     // linearize() for the chain variant.
     std::span<const std::uint8_t> as_span() const;

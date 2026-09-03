@@ -166,10 +166,11 @@ asio::awaitable<Result<Message>> ActiveUDPConnection::receive() {
     try {
         std::vector<uint8_t> buffer(65536);
         asio::ip::udp::endpoint sender_endpoint;
-        
-        co_await socket_.async_receive_from(
+
+        const std::size_t n = co_await socket_.async_receive_from(
                         asio::buffer(buffer), sender_endpoint, asio::use_awaitable);
-       
+        buffer.resize(n);  // keep only the datagram's bytes, not the 64 KiB buffer
+
         co_return make_message(std::move(buffer));
         
     } catch (const std::exception& e) {

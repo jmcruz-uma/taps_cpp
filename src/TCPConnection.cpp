@@ -65,6 +65,14 @@ namespace taps {
                     asio::buffer(hdr.data(), hn),
                     asio::buffer(body.data(), body.size())};
                 co_await asio::async_write(socket_, iov, asio::use_awaitable);
+            } else if (const BlockChain* chain = message.block_chain()) {
+                // Chain-backed Message (e.g. echoing one straight back): gather-write
+                // its blocks, no copy.
+                std::vector<asio::const_buffer> iov;
+                iov.reserve(chain->block_count());
+                for (const BlockRef& b : *chain)
+                    iov.push_back(asio::buffer(b.data(), b.size()));
+                co_await asio::async_write(socket_, iov, asio::use_awaitable);
             } else if (message.is_owning()) {
                 co_await asio::async_write(socket_,
                     asio::buffer(message.data()), asio::use_awaitable);
