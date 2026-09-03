@@ -27,6 +27,7 @@ class Message;
 class MessageContext;
 class MessageFramer;
 class BlockChain;  // src/buffer/block_chain.h — receive-path substrate (private)
+class BlockPool;   // src/buffer/block_pool.h  — receive-path substrate (private)
 class Connection;
 class Listener;
 class Preconnection;
@@ -538,7 +539,8 @@ class TCPConnection : public Connection {
 public:
     explicit TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint);
     explicit TCPConnection(asio::ip::tcp::socket socket);
-    
+    ~TCPConnection();  // out-of-line: block_pool_ is a pimpl to a private type
+
     asio::awaitable<Result<void>> send(const Message& message) override;
     asio::awaitable<Result<Message>> receive() override;
     asio::awaitable<Result<void>> close() override;
@@ -559,12 +561,15 @@ private:
     std::optional<asio::ip::tcp::endpoint> cached_remote_endpoint_;
     std::optional<asio::ip::tcp::endpoint> cached_local_endpoint_;
 
-        
+
     // Receive buffer management for framing
     std::vector<std::uint8_t> partial_frame_buffer_;
-    
+
+    // Pool of fixed-size blocks for the no-framer receive path (mode D / mode C).
+    std::unique_ptr<BlockPool> block_pool_;
+
     asio::awaitable<Result<Message>> receive_with_framing();
-    asio::awaitable<Result<Message>> receive_without_framing(); 
+    asio::awaitable<Result<Message>> receive_without_framing();
 };
 
 

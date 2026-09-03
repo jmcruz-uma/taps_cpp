@@ -1,10 +1,15 @@
 
 #include "taps/taps_api.h"
+#include "buffer/block_chain.h"
+#include "buffer/block_pool.h"
 #include <asio/use_awaitable.hpp>
+#include <asio/redirect_error.hpp>
+#include <asio/error.hpp>
 #include <asio/buffer.hpp>
 #include <asio/read.hpp>
 #include <asio/write.hpp>
 #include <algorithm>
+#include <memory>
 
 namespace taps {
 
@@ -13,13 +18,14 @@ namespace taps {
 // ============================================================================
 
     TCPConnection::TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint)
-        : socket_(ctx), receive_buffer_(65536){
+        : socket_(ctx), receive_buffer_(65536), block_pool_(std::make_unique<BlockPool>()){
             remote_endpoint_ = endpoint;
     }
-    
+
     // Constructor for accepted connections
     TCPConnection::TCPConnection(asio::ip::tcp::socket socket)
-        : socket_(std::move(socket)), receive_buffer_(65536) {
+        : socket_(std::move(socket)), receive_buffer_(65536),
+          block_pool_(std::make_unique<BlockPool>()) {
         state_ = ConnectionState::ESTABLISHED;
         
         // Cache endpoints
@@ -32,7 +38,10 @@ namespace taps {
             }
         }
     }
-    
+
+    // Out-of-line so ~unique_ptr<BlockPool> is instantiated where BlockPool is complete.
+    TCPConnection::~TCPConnection() = default;
+
     asio::awaitable<Result<void>> TCPConnection::send(const Message& message) {
         if (state_ != ConnectionState::ESTABLISHED) {
             co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, 
@@ -199,20 +208,36 @@ namespace taps {
     }
     
     asio::awaitable<Result<Message>> TCPConnection::receive_without_framing() {
-        // Without framing, we just read available data
-        auto bytes_read = co_await socket_.async_read_some(
-            asio::buffer(receive_buffer_), asio::use_awaitable);
-        
-        if (bytes_read == 0) {
+        // Mode D — RFC 9622 Section 9.3.2.2 (ReceivedPartial). With no Framer the
+        // whole connection is one Message of indeterminate length: deliver each
+        // chunk as it arrives in a pooled block, with is_end_of_message() bound to
+        // the peer's half-close. No accumulation; memory stays bounded for any
+        // transfer size. Blocks recycle through block_pool_'s free list, so the
+        // steady state does no allocation and no zero-fill.
+        BlockRef block = block_pool_->acquire();
+
+        asio::error_code ec;
+        std::size_t n = co_await socket_.async_read_some(
+            asio::buffer(block.writable_data(), block.capacity_after_begin()),
+            asio::redirect_error(asio::use_awaitable, ec));
+
+        if (ec == asio::error::eof) {
+            // Graceful close: final fragment, empty, endOfMessage = true.
             state_ = ConnectionState::CLOSED;
-            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, 
-                                              "Connection closed by peer"});
+            co_return Message(std::make_shared<BlockChain>(), MessageContext{},
+                              /*end_of_message=*/true);
         }
-        
-        receive_buffer_.resize(bytes_read);
-        auto owned = std::move(receive_buffer_);
-        receive_buffer_.resize(65536);
-        co_return Message(std::move(owned));
+        if (ec) {
+            state_ = ConnectionState::ERROR;
+            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, ec.message()});
+        }
+
+        auto chain = std::make_shared<BlockChain>();
+        if (n > 0) {
+            block.set_range(0, n);
+            chain->append(std::move(block));
+        }
+        co_return Message(std::move(chain), MessageContext{}, /*end_of_message=*/false);
     }
 
 
