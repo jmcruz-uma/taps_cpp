@@ -14,6 +14,7 @@
 #include <memory>
 #include <functional>
 #include <chrono>
+#include <cstddef>
 #include <span>
 #include <expected>
 #include <unordered_map>
@@ -25,6 +26,7 @@ namespace taps {
 class Message;
 class MessageContext;
 class MessageFramer;
+class BlockChain;  // src/buffer/block_chain.h — receive-path substrate (private)
 class Connection;
 class Listener;
 class Preconnection;
@@ -269,7 +271,7 @@ private:
 
 class Message {
 public:
-    // Owning: Message takes ownership of the vector. Required by the receive path.
+    // Owning: Message takes ownership of the vector. (Legacy receive path.)
     explicit Message(std::vector<std::uint8_t> data, MessageContext context = {})
         : owned_data_(std::move(data)), owning_(true), context_(std::move(context)) {}
 
@@ -278,29 +280,58 @@ public:
     explicit Message(std::span<const std::uint8_t> data, MessageContext context = {})
         : span_view_(data), owning_(false), context_(std::move(context)) {}
 
-    bool is_owning() const noexcept { return owning_; }
+    // Chain-backed: the receive path delivers the payload as a sequence of pooled
+    // blocks with no payload copy (modes C and D). `end_of_message` carries the
+    // RFC 9623 endOfMessage flag: false for a ReceivedPartial fragment, true for
+    // the final fragment or a whole Message.
+    explicit Message(std::shared_ptr<const BlockChain> chain,
+                     MessageContext context = {}, bool end_of_message = true)
+        : chain_(std::move(chain)), owning_(false),
+          end_of_message_(end_of_message), context_(std::move(context)) {}
 
-    // Valid only when is_owning() == true.
-    const std::vector<std::uint8_t>& data() const noexcept { return owned_data_; }
+    bool is_owning()  const noexcept { return owning_; }        // vector-backed
+    bool is_chained() const noexcept { return chain_ != nullptr; }
 
-    // Valid only when is_owning() == false.
+    // RFC 9623 endOfMessage. Always true for the vector / span variants: a classic
+    // complete Message is its own end.
+    bool is_end_of_message() const noexcept { return end_of_message_; }
+
+    // Total payload size in bytes, for any backing variant.
+    std::size_t size() const noexcept;
+
+    // Contiguous view of the payload. Cheap for the vector / span variants; for the
+    // chain variant it materialises the bytes once into an internal buffer and
+    // caches them (not thread-safe).
+    std::span<const std::byte> linearize();
+
+    // Valid only for the span variant (non-owning send path).
     std::span<const std::uint8_t> view() const noexcept { return span_view_; }
 
-    // Returns a view of the payload regardless of ownership variant.
-    std::span<const std::uint8_t> as_span() const noexcept {
-        if (owning_) return {owned_data_.data(), owned_data_.size()};
-        return span_view_;
-    }
+    // Contiguous byte view regardless of variant. Cheap for vector / span; forces
+    // linearize() for the chain variant.
+    std::span<const std::uint8_t> as_span() const;
+
+    // Legacy contiguous accessor. Prefer linearize() / size(). For the chain
+    // variant this linearises into an internal vector and returns a reference to it.
+    const std::vector<std::uint8_t>& data() const;
 
     const MessageContext& context() const noexcept { return context_; }
     void set_context(MessageContext context) { context_ = std::move(context); }
-    std::size_t length() const noexcept { return as_span().size(); }
+    std::size_t length() const noexcept { return size(); }
 
 private:
-    std::vector<std::uint8_t> owned_data_;
-    std::span<const std::uint8_t> span_view_;
-    bool owning_;
-    MessageContext context_;
+    // Fills and returns the chain-variant linearisation cache. Only meaningful when
+    // chain_ != nullptr.
+    const std::vector<std::uint8_t>& ensure_linearized() const;
+
+    std::vector<std::uint8_t>         owned_data_;
+    std::span<const std::uint8_t>     span_view_;
+    std::shared_ptr<const BlockChain> chain_;
+    mutable std::vector<std::uint8_t> linearized_;            // chain-variant cache
+    mutable bool                      linearized_valid_ = false;
+    bool                              owning_;
+    bool                              end_of_message_ = true;
+    MessageContext                    context_;
 };
 
 // ============================================================================
