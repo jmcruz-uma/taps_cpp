@@ -35,9 +35,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
         // Use TCP
         try {
             auto tcp_conn = std::make_unique<TCPConnection>(io_context_, endpoint);
-            
-            // Set default framer if none provided
-            tcp_conn->set_framer(std::make_unique<NoOpFramer>());
+
             auto conn_result = co_await tcp_conn->connect();
             
             co_return std::unique_ptr<Connection>(std::move(tcp_conn));
@@ -50,8 +48,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
         
         try {
             auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint);
-            udp_conn->set_framer(std::make_unique<NoOpFramer>());
-            
+
             co_return std::unique_ptr<Connection>(std::move(udp_conn));
         } catch (const std::exception& e) {
             co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, e.what()));
