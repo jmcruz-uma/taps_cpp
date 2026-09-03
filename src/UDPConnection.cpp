@@ -1,6 +1,8 @@
 #include "taps/taps_api.h"
 #include "taps/mailbox.h"
 #include "taps/message_framer.h"
+#include "buffer/block_chain.h"
+#include "buffer/block_pool.h"
 #include <asio/co_spawn.hpp>
 #include <asio/use_awaitable.hpp>
 #include <algorithm>
@@ -8,6 +10,7 @@
 #include <bit>
 #include <cassert>
 #include <cstddef>
+#include <memory>
 
 namespace taps {
 
@@ -60,8 +63,9 @@ PassiveUDPConnection::send(const Message& message) {
 asio::awaitable<Result<Message>>
 PassiveUDPConnection::receive() {
     try {
-        auto data = co_await mailbox_->receive();
-        co_return make_message(std::move(data));
+        // One datagram = one single-block chain from the listener's pool; no copy.
+        std::shared_ptr<BlockChain> datagram = co_await mailbox_->receive();
+        co_return Message(std::move(datagram), MessageContext{}, /*end_of_message=*/true);
     } catch (...) {
         state_ = ConnectionState::CLOSED;
         co_return std::unexpected(
@@ -107,9 +111,12 @@ PassiveUDPConnection::get_local_endpoint() const {
 // ============================================================================
 
 ActiveUDPConnection::ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::endpoint endpoint)
-    : socket_(ctx), remote_endpoint_(endpoint){
+    : socket_(ctx), remote_endpoint_(endpoint),
+      block_pool_(std::make_unique<BlockPool>()) {
     state_ = ConnectionState::ESTABLISHING;
 }
+
+ActiveUDPConnection::~ActiveUDPConnection() = default;
 
 
 asio::awaitable<Result<void>> ActiveUDPConnection::send(const Message& message) {
@@ -164,15 +171,22 @@ asio::awaitable<Result<Message>> ActiveUDPConnection::receive() {
     }
 
     try {
-        std::vector<uint8_t> buffer(65536);
+        // Read straight into a pooled block; deliver the datagram as a
+        // single-block chain, recycled when the Message is dropped. No copy.
+        BlockRef block = block_pool_->acquire();
         asio::ip::udp::endpoint sender_endpoint;
 
         const std::size_t n = co_await socket_.async_receive_from(
-                        asio::buffer(buffer), sender_endpoint, asio::use_awaitable);
-        buffer.resize(n);  // keep only the datagram's bytes, not the 64 KiB buffer
+            asio::buffer(block.writable_data(), block.capacity_after_begin()),
+            sender_endpoint, asio::use_awaitable);
 
-        co_return make_message(std::move(buffer));
-        
+        auto chain = std::make_shared<BlockChain>();
+        if (n > 0) {
+            block.set_range(0, n);
+            chain->append(std::move(block));
+        }
+        co_return Message(std::move(chain), MessageContext{}, /*end_of_message=*/true);
+
     } catch (const std::exception& e) {
         state_ = ConnectionState::ERROR;
         co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, e.what()));

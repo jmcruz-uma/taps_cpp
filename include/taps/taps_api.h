@@ -378,8 +378,6 @@ public:
         framer_ = std::move(framer);
     }
 
-    Result<Message> make_message(std::vector<uint8_t>&& buffer);
-
 protected:
     ConnectionState state_ = ConnectionState::ESTABLISHING;
     std::unique_ptr<MessageFramer> framer_;
@@ -523,18 +521,21 @@ class ActiveUDPConnection : public Connection {
 public:
 
     explicit ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::endpoint endpoint);
+    ~ActiveUDPConnection();  // out-of-line: block_pool_ points to a private type
 
     asio::awaitable<Result<void>> send(const Message& message) override;
     asio::awaitable<Result<Message>> receive() override;
     asio::awaitable<Result<void>> close() override;
     asio::awaitable<Result<void>> abort() override;
-    
+
     RemoteEndpoint get_remote_endpoint() const override;
     LocalEndpoint get_local_endpoint() const override;
-    
+
 private:
-    asio::ip::udp::socket socket_; 
+    asio::ip::udp::socket socket_;
     asio::ip::udp::endpoint remote_endpoint_;
+    // Fixed-size blocks for the receive path; one datagram per block, no copy.
+    std::unique_ptr<BlockPool> block_pool_;
 };
 
 class TCPListener : public Listener {
@@ -561,7 +562,8 @@ public:
     explicit UDPListener(asio::io_context& ctx, LocalEndpoint local,
                         TransportProperties properties = {},
                         SecurityParameters security = {});
-    
+    ~UDPListener();  // out-of-line: block_pool_ points to a private type
+
     asio::awaitable<Result<void>> listen() override;
     asio::awaitable<Result<std::unique_ptr<Connection>>> accept() override;
     asio::awaitable<Result<void>> stop() override;
@@ -573,6 +575,8 @@ private:
     asio::strand<asio::io_context::executor_type> strand_;
     std::unordered_map<asio::ip::udp::endpoint, std::shared_ptr<Mailbox>> mailboxes_;
     asio::experimental::channel<void(std::error_code, std::unique_ptr<PassiveUDPConnection>)> accept_channel_;
+    // One shared pool for the single receive loop; datagrams are one block each.
+    std::unique_ptr<BlockPool> block_pool_;
 };
 
 // ============================================================================
