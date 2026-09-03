@@ -36,8 +36,9 @@ include_directories(${ASIO_INCLUDE_DIR})
 add_subdirectory(src)        # Biblioteca TAPS
 add_subdirectory(examples)   # Ejemplos
 
-# Tests unitarios (no los construye el target taps_static; opt-in)
-option(TAPS_BUILD_TESTS "Build TAPS unit tests" ON)
+# Tests unitarios: opt-in (-DTAPS_BUILD_TESTS=ON). Off por defecto para que los
+# consumidores que hacen `cmake --build` sin filtrar target no los construyan.
+option(TAPS_BUILD_TESTS "Build TAPS unit tests" OFF)
 if(TAPS_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
