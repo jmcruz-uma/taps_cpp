@@ -502,10 +502,14 @@ public:
     asio::awaitable<Result<Message>> receive() override;
     asio::awaitable<Result<void>> close() override;
     asio::awaitable<Result<void>> abort() override;
-    
+
     RemoteEndpoint get_remote_endpoint() const override;
     LocalEndpoint get_local_endpoint() const override;
-    
+
+    // Datagrams discarded (drop-oldest) because the receive ring was full while
+    // the application was not consuming fast enough. UDP has no flow control.
+    std::size_t datagrams_dropped() const noexcept;
+
     friend class UDPListener;
 
 private:

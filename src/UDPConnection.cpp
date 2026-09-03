@@ -105,6 +105,10 @@ PassiveUDPConnection::get_local_endpoint() const {
         local.port());
 }
 
+std::size_t PassiveUDPConnection::datagrams_dropped() const noexcept {
+    return mailbox_ ? mailbox_->dropped() : 0;
+}
+
 
 // ============================================================================
 // ActiveUDPConnection Implementation
