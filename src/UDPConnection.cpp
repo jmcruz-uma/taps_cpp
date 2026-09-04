@@ -37,7 +37,7 @@ PassiveUDPConnection::~PassiveUDPConnection() {
 asio::awaitable<Result<void>>
 PassiveUDPConnection::send(const Message& message) {
     try {
-        const auto body = message.as_span();
+        const auto body = message.as_bytes();
         if (framer_) {
             std::array<std::byte, 64> hdr;
             assert(framer_->max_header_size() <= hdr.size());
@@ -136,7 +136,7 @@ asio::awaitable<Result<void>> ActiveUDPConnection::send(const Message& message) 
             state_ = ConnectionState::ESTABLISHED;
         }
         
-        const auto body = message.as_span();
+        const auto body = message.as_bytes();
         std::array<std::byte, 64> hdr;
         std::size_t hn = 0;
         if (framer_) {

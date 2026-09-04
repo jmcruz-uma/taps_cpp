@@ -2,6 +2,7 @@
 
 #include "buffer/block_chain.h"
 
+#include <cstring>
 #include <span>
 
 namespace taps {
@@ -26,7 +27,7 @@ std::size_t Message::size() const noexcept {
     return span_view_.size();
 }
 
-std::span<const std::byte> Message::linearize() {
+std::span<const std::byte> Message::as_bytes() const {
     if (chain_) {
         const std::vector<std::uint8_t>& v = ensure_linearized();
         return std::as_bytes(std::span<const std::uint8_t>(v));
@@ -35,18 +36,29 @@ std::span<const std::byte> Message::linearize() {
     return std::as_bytes(span_view_);
 }
 
-std::span<const std::uint8_t> Message::as_span() const {
+std::vector<std::span<const std::byte>> Message::blocks() const {
+    std::vector<std::span<const std::byte>> out;
     if (chain_) {
-        const std::vector<std::uint8_t>& v = ensure_linearized();
-        return {v.data(), v.size()};
+        out.reserve(chain_->block_count());
+        for (const BlockRef& b : *chain_)
+            out.push_back(b.bytes());
+        return out;
     }
-    if (owning_) return {owned_data_.data(), owned_data_.size()};
-    return span_view_;
+    if (owning_)
+        out.push_back(std::as_bytes(std::span<const std::uint8_t>(owned_data_)));
+    else
+        out.push_back(std::as_bytes(span_view_));
+    return out;
 }
 
-const std::vector<std::uint8_t>& Message::data() const {
-    if (chain_) return ensure_linearized();
-    return owned_data_;
+// Free function: assemble into the caller's buffer, no internal allocation.
+std::size_t copy(std::span<std::byte> out, const Message& msg) {
+    if (const BlockChain* ch = msg.block_chain())
+        return ch->copy_to(out.first(msg.size()));   // walk blocks, no cache touched
+
+    const auto s = msg.as_bytes();                    // vector / span: a cheap view
+    std::memcpy(out.data(), s.data(), s.size());
+    return s.size();
 }
 
 }  // namespace taps

@@ -48,8 +48,8 @@ int main() {
                 }
 
                 auto message = std::move(*receive_result);
-                auto message_data = message.data();
-                std::string received_msg(message_data.begin(), message_data.end());
+                auto message_data = message.as_bytes();
+                std::string received_msg(reinterpret_cast<const char*>(message_data.data()), message_data.size());
                 std::println("Message received: {}", received_msg);
 
                 // Responder al cliente

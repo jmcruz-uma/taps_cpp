@@ -1,7 +1,7 @@
-// Tests for the Message backing variants after commit 2: the existing vector /
-// span variants must be unchanged, and the new chain-backed variant must report
-// size / endOfMessage and linearise correctly while releasing its blocks with the
-// Message.
+// Tests for the Message byte-access API: the vector / span variants stay cheap,
+// the chain-backed variant reports size / endOfMessage, exposes its blocks with
+// zero copy, assembles contiguously on demand via as_bytes(), and copies into a
+// caller buffer via taps::copy(). Blocks are released with the Message.
 
 #include "taps/taps_api.h"
 
@@ -30,9 +30,7 @@ static int g_failures = 0;
     } while (0)
 
 static bool bytes_equal(std::span<const std::byte> b, const std::string& s) {
-    if (b.size() != s.size())
-        return false;
-    return std::memcmp(b.data(), s.data(), s.size()) == 0;
+    return b.size() == s.size() && std::memcmp(b.data(), s.data(), s.size()) == 0;
 }
 
 // Builds a chain holding a copy of `s` split into `block`-sized links.
@@ -52,7 +50,7 @@ static std::shared_ptr<BlockChain> make_chain(BlockPool& pool, const std::string
     return chain;
 }
 
-static void test_vector_variant_unchanged() {
+static void test_vector_variant() {
     std::vector<std::uint8_t> src{10, 20, 30, 40};
     Message m(src);
     CHECK(m.is_owning());
@@ -60,14 +58,17 @@ static void test_vector_variant_unchanged() {
     CHECK(m.is_end_of_message());          // classic Message is its own end
     CHECK(m.size() == 4);
     CHECK(m.length() == 4);
-    CHECK(m.data().size() == 4);
-    CHECK(m.data()[2] == 30);
-    const auto lin = m.linearize();
-    CHECK(lin.size() == 4);
-    CHECK(std::to_integer<int>(lin[0]) == 10);
+
+    const auto b = m.as_bytes();
+    CHECK(b.size() == 4);
+    CHECK(std::to_integer<int>(b[2]) == 30);
+
+    const auto segs = m.blocks();
+    CHECK(segs.size() == 1);              // contiguous -> a single segment
+    CHECK(segs[0].size() == 4);
 }
 
-static void test_span_variant_unchanged() {
+static void test_span_variant() {
     std::vector<std::uint8_t> src{1, 2, 3, 4, 5};
     const std::span<const std::uint8_t> sp(src);
     Message m(sp);
@@ -75,13 +76,14 @@ static void test_span_variant_unchanged() {
     CHECK(!m.is_chained());
     CHECK(m.is_end_of_message());
     CHECK(m.size() == 5);
-    CHECK(m.view().size() == 5);
-    CHECK(m.view().data() == src.data());  // still a view, no copy
-    CHECK(m.linearize().data() ==
-          reinterpret_cast<const std::byte*>(src.data()));
+
+    // as_bytes() on the span variant is a view over the caller's data, no copy.
+    CHECK(m.as_bytes().data() == reinterpret_cast<const std::byte*>(src.data()));
+    CHECK(m.blocks().size() == 1);
+    CHECK(m.blocks()[0].data() == reinterpret_cast<const std::byte*>(src.data()));
 }
 
-static void test_chain_variant_whole() {
+static void test_chain_as_bytes() {
     BlockPool pool(/*block_size=*/16);
     const std::string s = "the quick brown fox jumps over the lazy dog, twice.";
     auto chain = make_chain(pool, s, 16);
@@ -94,19 +96,55 @@ static void test_chain_variant_whole() {
     CHECK(m.size() == s.size());
     CHECK(m.length() == s.size());
 
-    CHECK(bytes_equal(m.linearize(), s));
-    CHECK(m.as_span().size() == s.size());
-    CHECK(std::memcmp(m.as_span().data(), s.data(), s.size()) == 0);
-    CHECK(m.data().size() == s.size());
+    CHECK(bytes_equal(m.as_bytes(), s));
 
-    // Linearisation is cached: same storage on repeated calls.
-    const auto first = m.linearize();
-    const auto second = m.linearize();
-    CHECK(first.data() == second.data());
-    CHECK(m.data().data() == reinterpret_cast<const std::uint8_t*>(first.data()));
+    // as_bytes() caches: same storage on repeated calls.
+    CHECK(m.as_bytes().data() == m.as_bytes().data());
 }
 
-static void test_chain_variant_partial() {
+static void test_chain_blocks_zero_copy() {
+    BlockPool pool(/*block_size=*/16);
+    const std::string s(70, '\0');
+    std::string filled = s;
+    for (std::size_t i = 0; i < filled.size(); ++i)
+        filled[i] = static_cast<char>(i);
+    auto chain = make_chain(pool, filled, 16);
+
+    Message m(chain);
+    const auto segs = m.blocks();
+    CHECK(segs.size() == chain->block_count());     // one segment per block
+    CHECK(segs.size() == 5);                        // 70 / 16 -> 4x16 + 6
+
+    // Segments point straight into the pooled blocks (no copy) and concatenate
+    // back to the original stream.
+    std::size_t off = 0;
+    for (const auto seg : segs) {
+        CHECK(std::memcmp(seg.data(), filled.data() + off, seg.size()) == 0);
+        off += seg.size();
+    }
+    CHECK(off == filled.size());
+}
+
+static void test_free_copy() {
+    BlockPool pool(/*block_size=*/8);
+    const std::string s = "assemble me into a caller buffer";
+    auto chain = make_chain(pool, s, 8);
+    Message chained(chain);
+
+    std::vector<std::byte> out(chained.size());
+    const std::size_t n = taps::copy(out, chained);
+    CHECK(n == s.size());
+    CHECK(bytes_equal(out, s));
+
+    // Same free function on a vector-backed Message.
+    std::vector<std::uint8_t> src(s.begin(), s.end());
+    Message owned(src);
+    std::vector<std::byte> out2(owned.size());
+    CHECK(taps::copy(out2, owned) == s.size());
+    CHECK(bytes_equal(out2, s));
+}
+
+static void test_chain_partial() {
     BlockPool pool(/*block_size=*/32);
     const std::string s = "fragment without end";
     auto chain = make_chain(pool, s, 32);
@@ -115,7 +153,7 @@ static void test_chain_variant_partial() {
     CHECK(m.is_chained());
     CHECK(!m.is_end_of_message());
     CHECK(m.size() == s.size());
-    CHECK(bytes_equal(m.linearize(), s));
+    CHECK(bytes_equal(m.as_bytes(), s));
 }
 
 static void test_chain_blocks_released_with_message() {
@@ -137,10 +175,12 @@ static void test_chain_blocks_released_with_message() {
 }
 
 int main() {
-    test_vector_variant_unchanged();
-    test_span_variant_unchanged();
-    test_chain_variant_whole();
-    test_chain_variant_partial();
+    test_vector_variant();
+    test_span_variant();
+    test_chain_as_bytes();
+    test_chain_blocks_zero_copy();
+    test_free_copy();
+    test_chain_partial();
     test_chain_blocks_released_with_message();
 
     if (g_failures == 0) {

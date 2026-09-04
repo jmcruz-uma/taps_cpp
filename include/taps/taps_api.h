@@ -300,36 +300,31 @@ public:
     // complete Message is its own end.
     bool is_end_of_message() const noexcept { return end_of_message_; }
 
-    // Total payload size in bytes, for any backing variant.
+    // Total payload size in bytes, for any backing variant. O(1).
     std::size_t size() const noexcept;
+    std::size_t length() const noexcept { return size(); }
 
-    // Contiguous view of the payload. Cheap for the vector / span variants; for the
-    // chain variant it materialises the bytes once into an internal buffer and
-    // caches them (not thread-safe).
-    std::span<const std::byte> linearize();
+    // The payload as one contiguous byte range. Cheap for the vector / span
+    // variants; for the chain variant it assembles the blocks once into an
+    // internal buffer and caches the result (not thread-safe). Use blocks() to
+    // consume a chain-backed Message without this copy.
+    std::span<const std::byte> as_bytes() const;
 
-    // Valid only for the span variant (non-owning send path).
-    std::span<const std::uint8_t> view() const noexcept { return span_view_; }
+    // The payload as its constituent contiguous segments, in order (one segment
+    // per pooled block; a single segment for the vector / span variants). Zero
+    // copy. Each span is valid for the lifetime of this Message.
+    std::vector<std::span<const std::byte>> blocks() const;
 
     // The block chain backing this Message, or nullptr for the vector / span
     // variants. Used by the transport send path for gather-write; BlockChain is
     // an implementation type, opaque to applications.
     const BlockChain* block_chain() const noexcept { return chain_.get(); }
 
-    // Contiguous byte view regardless of variant. Cheap for vector / span; forces
-    // linearize() for the chain variant.
-    std::span<const std::uint8_t> as_span() const;
-
-    // Legacy contiguous accessor. Prefer linearize() / size(). For the chain
-    // variant this linearises into an internal vector and returns a reference to it.
-    const std::vector<std::uint8_t>& data() const;
-
     const MessageContext& context() const noexcept { return context_; }
     void set_context(MessageContext context) { context_ = std::move(context); }
-    std::size_t length() const noexcept { return size(); }
 
 private:
-    // Fills and returns the chain-variant linearisation cache. Only meaningful when
+    // Fills and returns the chain-variant assembly cache. Only meaningful when
     // chain_ != nullptr.
     const std::vector<std::uint8_t>& ensure_linearized() const;
 
@@ -608,10 +603,10 @@ private:
 // Utility Functions
 // ============================================================================
 
-template<typename T>
-concept MessageLike = requires(T t) {
-    { t.data() } -> std::convertible_to<std::span<const std::uint8_t>>;
-};
+// Assemble a Message's payload into the caller's contiguous buffer. `out` must be
+// at least msg.size() bytes; returns the number of bytes written. Performs no
+// allocation of its own (unlike Message::as_bytes(), which caches internally).
+std::size_t copy(std::span<std::byte> out, const Message& msg);
 
 // Non-owning factory for binary data — caller must keep the source alive through send().
 template<std::ranges::contiguous_range R>

@@ -60,7 +60,7 @@ namespace taps {
                 std::array<std::byte, 64> hdr;
                 assert(framer_->max_header_size() <= hdr.size());
                 const std::size_t hn = framer_->write_header(message, hdr);
-                const auto body = message.as_span();
+                const auto body = message.as_bytes();
                 const std::array<asio::const_buffer, 2> iov{
                     asio::buffer(hdr.data(), hn),
                     asio::buffer(body.data(), body.size())};
@@ -73,13 +73,11 @@ namespace taps {
                 for (const BlockRef& b : *chain)
                     iov.push_back(asio::buffer(b.data(), b.size()));
                 co_await asio::async_write(socket_, iov, asio::use_awaitable);
-            } else if (message.is_owning()) {
-                co_await asio::async_write(socket_,
-                    asio::buffer(message.data()), asio::use_awaitable);
             } else {
-                auto s = message.view();
+                // vector / span variant: one contiguous buffer.
+                const auto body = message.as_bytes();
                 co_await asio::async_write(socket_,
-                    asio::buffer(s.data(), s.size()), asio::use_awaitable);
+                    asio::buffer(body.data(), body.size()), asio::use_awaitable);
             }
             
             co_return std::expected<void, TAPSError>{std::in_place};
