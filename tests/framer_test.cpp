@@ -181,12 +181,46 @@ static void test_lpf_write_header_roundtrip() {
     CHECK(r.deliver == 513);
 }
 
+static void test_passthrough() {
+    BlockPool pool(/*block_size=*/16);
+    std::vector<std::byte> raw;         // no framing header for passthrough
+    for (int i = 0; i < 50; ++i) raw.push_back(std::byte(static_cast<std::uint8_t>(i)));
+    BlockChain chain;
+    fill_chain(chain, pool, raw, 16);   // 4 blocks
+
+    PassthroughFramer keep_lazy(/*materialize=*/false);
+    PassthroughFramer keep_flat(/*materialize=*/true);
+
+    // Nothing delivered until the peer half-closes.
+    CHECK(keep_lazy.parse(ReceiveCursor(chain), false).action == ParseResult::Action::NeedMore);
+    CHECK(keep_flat.parse(ReceiveCursor(chain), false).action == ParseResult::Action::NeedMore);
+
+    // At EOF: one record = the whole chain, endOfMessage, materialize per ctor.
+    auto a = keep_lazy.parse(ReceiveCursor(chain), true);
+    CHECK(a.action == ParseResult::Action::Emit);
+    CHECK(a.deliver == 50);
+    CHECK(a.discard_before == 0);
+    CHECK(a.end_of_message);
+    CHECK(a.materialize == false);
+
+    auto b = keep_flat.parse(ReceiveCursor(chain), true);
+    CHECK(b.action == ParseResult::Action::Emit);
+    CHECK(b.deliver == 50);
+    CHECK(b.materialize == true);
+
+    CHECK(keep_lazy.max_header_size() == 0);
+    Message dummy(std::vector<std::uint8_t>(10));
+    std::byte h[4];
+    CHECK(keep_lazy.write_header(dummy, h) == 0);
+}
+
 int main() {
     test_cursor_copy_out_across_blocks();
     test_cursor_try_contiguous();
     test_lpf_parse_need_more();
     test_lpf_parse_emit_and_second_record();
     test_lpf_write_header_roundtrip();
+    test_passthrough();
 
     if (g_failures == 0) {
         std::printf("framer_test: OK\n");

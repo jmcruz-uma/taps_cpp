@@ -275,9 +275,12 @@ private:
 
 class Message {
 public:
-    // Owning: Message takes ownership of the vector. (Legacy receive path.)
-    explicit Message(std::vector<std::uint8_t> data, MessageContext context = {})
-        : owned_data_(std::move(data)), owning_(true), context_(std::move(context)) {}
+    // Owning: Message takes ownership of the vector. Used by the receive path when
+    // a record is assembled contiguously before delivery.
+    explicit Message(std::vector<std::uint8_t> data, MessageContext context = {},
+                     bool end_of_message = true)
+        : owned_data_(std::move(data)), owning_(true),
+          end_of_message_(end_of_message), context_(std::move(context)) {}
 
     // Non-owning: zero-copy send path (RFC 9623).
     // Caller must keep the referenced data alive for the duration of any send() call.

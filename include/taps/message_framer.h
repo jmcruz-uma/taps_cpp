@@ -45,17 +45,20 @@ struct ParseResult {
     std::size_t discard_before = 0;   // framing overhead to drop before the body
     std::size_t deliver        = 0;   // body bytes delivered as one Message
     bool        end_of_message = true;
+    bool        materialize    = false;  // assemble the record into one contiguous
+                                        // owning Message before delivery, instead
+                                        // of delivering the block chain
 
     // Action::NeedMore — hint of the total cursor size parse() needs before it can
     // make progress (0 = unknown).
     std::size_t min_bytes_needed = 0;
 
     static ParseResult need_more(std::size_t hint = 0) noexcept {
-        return {Action::NeedMore, 0, 0, true, hint};
+        return {Action::NeedMore, 0, 0, true, false, hint};
     }
     static ParseResult emit(std::size_t deliver, bool eom = true,
                             std::size_t discard_before = 0) noexcept {
-        return {Action::Emit, discard_before, deliver, eom, 0};
+        return {Action::Emit, discard_before, deliver, eom, false, 0};
     }
 };
 
@@ -94,6 +97,36 @@ public:
 private:
     std::size_t length_field_size_;
     std::endian byte_order_;
+};
+
+// No framing: the connection's whole byte-stream in a direction is one Message,
+// bounded only by the peer's half-close (RFC 9622 Section 9.3.2.2; RFC 9623
+// Section 5.2, "Each Message ... corresponds to the entire stream of bytes in a
+// direction"). Installing this framer is how an application asks for the transfer
+// as a single Message.
+//
+// `materialize` (default true): the receive path assembles the blocks into one
+// contiguous owning Message before delivery, so as_bytes() is a free view and the
+// application needs no knowledge of the block model. Set it false to receive the
+// block chain and consume it directly (blocks() / taps::copy), avoiding the copy.
+//
+// Accumulates until the half-close: for bounded transfers only.
+class PassthroughFramer : public MessageFramer {
+public:
+    explicit PassthroughFramer(bool materialize = true) : materialize_(materialize) {}
+
+    ParseResult parse(const ReceiveCursor& cursor, bool at_eof) override {
+        if (!at_eof)
+            return ParseResult::need_more();
+        ParseResult r = ParseResult::emit(cursor.size(), /*eom=*/true);
+        r.materialize = materialize_;
+        return r;
+    }
+    std::size_t write_header(const Message&, std::span<std::byte>) override { return 0; }
+    std::size_t max_header_size() const noexcept override { return 0; }
+
+private:
+    bool materialize_;
 };
 
 }  // namespace taps

@@ -199,6 +199,18 @@ namespace taps {
             if (pr.action == ParseResult::Action::Emit) {
                 if (pr.discard_before > 0)
                     receive_chain_->consume_front(pr.discard_before);
+
+                if (pr.materialize) {
+                    // Assemble the record into one contiguous owning Message.
+                    BlockChain slice = receive_chain_->first(pr.deliver);
+                    std::vector<std::uint8_t> buf(slice.size());
+                    slice.copy_to(std::as_writable_bytes(std::span<std::uint8_t>(buf)));
+                    receive_chain_->consume_front(pr.deliver);
+                    co_return Message(std::move(buf), MessageContext{},
+                                      /*end_of_message=*/pr.end_of_message);
+                }
+
+                // Deliver a refcounted slice of the chain — no payload copy.
                 auto slice = std::make_shared<BlockChain>(receive_chain_->first(pr.deliver));
                 receive_chain_->consume_front(pr.deliver);
                 co_return Message(std::move(slice), MessageContext{}, pr.end_of_message);
