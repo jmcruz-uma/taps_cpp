@@ -3,6 +3,7 @@
 #include "buffer/block_chain.h"
 
 #include <cstring>
+#include <memory>
 #include <span>
 
 namespace taps {
@@ -10,15 +11,18 @@ namespace taps {
 // Definitions that need the complete BlockChain type live here; the public header
 // only forward-declares it so the block substrate stays private to src/.
 
-const std::vector<std::uint8_t>& Message::ensure_linearized() const {
-    if (!linearized_valid_) {
-        if (chain_) {
-            linearized_.resize(chain_->size());
-            chain_->copy_to(std::as_writable_bytes(std::span<std::uint8_t>(linearized_)));
-        }
-        linearized_valid_ = true;
+std::span<const std::byte> Message::ensure_gathered() const {
+    if (!gathered_valid_) {
+        const std::size_t n = chain_ ? chain_->size() : 0;
+        // new[] (not make_shared) leaves the bytes uninitialised — we overwrite
+        // all of them immediately; no wasted zero-fill.
+        gathered_ = std::shared_ptr<std::byte[]>(new std::byte[n]);
+        gathered_size_ = n;
+        if (chain_ && n)
+            chain_->copy_to(std::span<std::byte>(gathered_.get(), n));
+        gathered_valid_ = true;
     }
-    return linearized_;
+    return {gathered_.get(), gathered_size_};
 }
 
 std::size_t Message::size() const noexcept {
@@ -28,10 +32,7 @@ std::size_t Message::size() const noexcept {
 }
 
 std::span<const std::byte> Message::as_bytes() const {
-    if (chain_) {
-        const std::vector<std::uint8_t>& v = ensure_linearized();
-        return std::as_bytes(std::span<const std::uint8_t>(v));
-    }
+    if (chain_)  return ensure_gathered();
     if (owning_) return std::as_bytes(std::span<const std::uint8_t>(owned_data_));
     return std::as_bytes(span_view_);
 }
@@ -51,8 +52,8 @@ std::vector<std::span<const std::byte>> Message::blocks() const {
     return out;
 }
 
-// Free function: assemble into the caller's buffer, no internal allocation.
-std::size_t copy(std::span<std::byte> out, const Message& msg) {
+// Free function: gather into the caller's buffer, no internal allocation.
+std::size_t gather(std::span<std::byte> out, const Message& msg) {
     if (const BlockChain* ch = msg.block_chain())
         return ch->copy_to(out.first(msg.size()));   // walk blocks, no cache touched
 

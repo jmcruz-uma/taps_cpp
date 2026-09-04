@@ -45,9 +45,9 @@ struct ParseResult {
     std::size_t discard_before = 0;   // framing overhead to drop before the body
     std::size_t deliver        = 0;   // body bytes delivered as one Message
     bool        end_of_message = true;
-    bool        materialize    = false;  // assemble the record into one contiguous
-                                        // owning Message before delivery, instead
-                                        // of delivering the block chain
+    bool        gather         = false;  // gather the record into one contiguous
+                                        // buffer before delivery, so as_bytes() is
+                                        // a free view; otherwise deliver the chain
 
     // Action::NeedMore — hint of the total cursor size parse() needs before it can
     // make progress (0 = unknown).
@@ -105,28 +105,28 @@ private:
 // direction"). Installing this framer is how an application asks for the transfer
 // as a single Message.
 //
-// `materialize` (default true): the receive path assembles the blocks into one
-// contiguous owning Message before delivery, so as_bytes() is a free view and the
-// application needs no knowledge of the block model. Set it false to receive the
-// block chain and consume it directly (blocks() / taps::copy), avoiding the copy.
+// `gather` (default true): the receive path gathers the blocks into one contiguous
+// buffer before delivery, so as_bytes() is a free view and the application needs
+// no knowledge of the block model. Set it false to receive the block chain and
+// consume it directly (blocks() / taps::gather), avoiding the copy.
 //
 // Accumulates until the half-close: for bounded transfers only.
 class PassthroughFramer : public MessageFramer {
 public:
-    explicit PassthroughFramer(bool materialize = true) : materialize_(materialize) {}
+    explicit PassthroughFramer(bool gather = true) : gather_(gather) {}
 
     ParseResult parse(const ReceiveCursor& cursor, bool at_eof) override {
         if (!at_eof)
             return ParseResult::need_more();
         ParseResult r = ParseResult::emit(cursor.size(), /*eom=*/true);
-        r.materialize = materialize_;
+        r.gather = gather_;
         return r;
     }
     std::size_t write_header(const Message&, std::span<std::byte>) override { return 0; }
     std::size_t max_header_size() const noexcept override { return 0; }
 
 private:
-    bool materialize_;
+    bool gather_;
 };
 
 }  // namespace taps

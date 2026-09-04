@@ -188,25 +188,25 @@ static void test_passthrough() {
     BlockChain chain;
     fill_chain(chain, pool, raw, 16);   // 4 blocks
 
-    PassthroughFramer keep_lazy(/*materialize=*/false);
-    PassthroughFramer keep_flat(/*materialize=*/true);
+    PassthroughFramer keep_lazy(/*gather=*/false);
+    PassthroughFramer keep_flat(/*gather=*/true);
 
     // Nothing delivered until the peer half-closes.
     CHECK(keep_lazy.parse(ReceiveCursor(chain), false).action == ParseResult::Action::NeedMore);
     CHECK(keep_flat.parse(ReceiveCursor(chain), false).action == ParseResult::Action::NeedMore);
 
-    // At EOF: one record = the whole chain, endOfMessage, materialize per ctor.
+    // At EOF: one record = the whole chain, endOfMessage, gather per ctor.
     auto a = keep_lazy.parse(ReceiveCursor(chain), true);
     CHECK(a.action == ParseResult::Action::Emit);
     CHECK(a.deliver == 50);
     CHECK(a.discard_before == 0);
     CHECK(a.end_of_message);
-    CHECK(a.materialize == false);
+    CHECK(a.gather == false);
 
     auto b = keep_flat.parse(ReceiveCursor(chain), true);
     CHECK(b.action == ParseResult::Action::Emit);
     CHECK(b.deliver == 50);
-    CHECK(b.materialize == true);
+    CHECK(b.gather == true);
 
     CHECK(keep_lazy.max_header_size() == 0);
     Message dummy(std::vector<std::uint8_t>(10));

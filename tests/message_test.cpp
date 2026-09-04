@@ -1,7 +1,7 @@
 // Tests for the Message byte-access API: the vector / span variants stay cheap,
 // the chain-backed variant reports size / endOfMessage, exposes its blocks with
 // zero copy, assembles contiguously on demand via as_bytes(), and copies into a
-// caller buffer via taps::copy(). Blocks are released with the Message.
+// caller buffer via taps::gather(). Blocks are released with the Message.
 
 #include "taps/taps_api.h"
 
@@ -132,7 +132,7 @@ static void test_free_copy() {
     Message chained(chain);
 
     std::vector<std::byte> out(chained.size());
-    const std::size_t n = taps::copy(out, chained);
+    const std::size_t n = taps::gather(out, chained);
     CHECK(n == s.size());
     CHECK(bytes_equal(out, s));
 
@@ -140,7 +140,7 @@ static void test_free_copy() {
     std::vector<std::uint8_t> src(s.begin(), s.end());
     Message owned(src);
     std::vector<std::byte> out2(owned.size());
-    CHECK(taps::copy(out2, owned) == s.size());
+    CHECK(taps::gather(out2, owned) == s.size());
     CHECK(bytes_equal(out2, s));
 }
 
