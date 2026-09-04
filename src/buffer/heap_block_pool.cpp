@@ -1,5 +1,6 @@
 #include "buffer/heap_block_pool.h"
 
+#include <algorithm>
 #include <cassert>
 
 namespace taps {
@@ -69,6 +70,25 @@ std::size_t HeapBlockPool::free_blocks() const noexcept {
 std::size_t HeapBlockPool::live_blocks() const noexcept {
     std::lock_guard<std::mutex> lk(mtx_);
     return live_count_;
+}
+
+void HeapBlockPool::warm_up(std::size_t count) {
+    const std::size_t target = std::min(count, max_free_blocks_);
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (free_count_ >= target) return;
+        }
+        DataBlock* blk = new DataBlock(this, block_size_);  // outside the lock
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (free_count_ >= target) {
+            delete blk;  // a concurrent warm_up()/recycle() got there first
+            return;
+        }
+        blk->next_free_ = free_list_;
+        free_list_ = blk;
+        ++free_count_;
+    }
 }
 
 }  // namespace taps

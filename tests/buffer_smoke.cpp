@@ -118,6 +118,35 @@ static void test_live_cap_backpressure() {
     CHECK(pool.live_blocks() == 3);
 }
 
+static void test_warm_up() {
+    HeapBlockPool pool(/*block_size=*/1024, /*max_free_blocks=*/4);
+    CHECK(pool.free_blocks() == 0);
+
+    pool.warm_up(4);
+    CHECK(pool.free_blocks() == 4);             // parked, not checked out
+    CHECK(pool.live_blocks() == 0);
+
+    // A capped request is clamped to max_free_blocks, not overfilled.
+    pool.warm_up(100);
+    CHECK(pool.free_blocks() == 4);
+
+    // acquire() now pulls from the warmed free list instead of minting fresh
+    // storage; four in a row must not touch the (already-exhausted) free list.
+    BlockRef a = pool.acquire();
+    BlockRef b = pool.acquire();
+    BlockRef c = pool.acquire();
+    BlockRef d = pool.acquire();
+    CHECK(a.valid() && b.valid() && c.valid() && d.valid());
+    CHECK(pool.free_blocks() == 0);
+    CHECK(pool.live_blocks() == 4);
+
+    // A fifth still works (falls back to `new`, exactly as an un-warmed pool
+    // would) — warm_up() only removes that fallback for the first `count`.
+    BlockRef e = pool.acquire();
+    CHECK(e.valid());
+    CHECK(pool.live_blocks() == 5);
+}
+
 static void test_chain_append_and_linearize() {
     HeapBlockPool pool(/*block_size=*/64);
     BlockChain chain;
@@ -222,6 +251,7 @@ int main() {
     test_blockref_shared_ownership();
     test_free_list_cap();
     test_live_cap_backpressure();
+    test_warm_up();
     test_chain_append_and_linearize();
     test_chain_consume_front();
     test_chain_first_slice();

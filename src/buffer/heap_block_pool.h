@@ -21,6 +21,9 @@ namespace taps {
 // receive path uses this as the signal to stop issuing reads (backpressure for
 // unreliable transports, where the transport itself provides none).
 //
+// acquire() still falls back to `new` the first time it outgrows a still-empty
+// free list — call warm_up() once, before traffic flows, to avoid that.
+//
 // Thread-safety: one HeapBlockPool belongs to one Connection; acquire() and
 // recycle() (the latter invoked when a BlockRef's count hits zero) normally run
 // on that Connection's executor, so the internal mutex is uncontended. It is
@@ -49,6 +52,16 @@ public:
 
     std::size_t free_blocks() const noexcept override;
     std::size_t live_blocks() const noexcept override;
+
+    // Eagerly mints DataBlocks and parks them on the free list until it holds
+    // `count` (clamped to max_free_blocks — the list never retains more than
+    // that anyway), so later acquire() calls pull from the free list instead of
+    // hitting `new`. Call it once, at setup, before traffic flows: that is the
+    // guarantee most real-time/embedded coding standards actually ask for —
+    // dynamic allocation at init is fine, allocation once the hot path is
+    // running is not. It does nothing useful once blocks are already checked
+    // out and cycling (a live block isn't free to pre-populate with).
+    void warm_up(std::size_t count);
 
 private:
     void recycle(DataBlock* blk) noexcept override;
