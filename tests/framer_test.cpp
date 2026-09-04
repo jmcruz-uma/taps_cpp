@@ -6,6 +6,7 @@
 
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
+#include "buffer/heap_block_pool.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -54,7 +55,7 @@ static std::vector<std::byte> record(std::uint32_t len, std::uint8_t body_seed) 
 }
 
 static void test_cursor_copy_out_across_blocks() {
-    BlockPool pool(/*block_size=*/4);
+    HeapBlockPool pool(/*block_size=*/4);
     std::vector<std::byte> data;
     for (int i = 0; i < 20; ++i) data.push_back(std::byte(static_cast<std::uint8_t>(i)));
     BlockChain chain;
@@ -71,7 +72,7 @@ static void test_cursor_copy_out_across_blocks() {
 }
 
 static void test_cursor_try_contiguous() {
-    BlockPool pool(/*block_size=*/8);
+    HeapBlockPool pool(/*block_size=*/8);
     std::vector<std::byte> data(24);
     for (std::size_t i = 0; i < data.size(); ++i) data[i] = std::byte(static_cast<std::uint8_t>(i));
     BlockChain chain;
@@ -92,7 +93,7 @@ static void test_cursor_try_contiguous() {
 }
 
 static void test_lpf_parse_need_more() {
-    BlockPool pool(64);
+    HeapBlockPool pool(64);
     LengthPrefixedFramer f;  // 4-byte big-endian
 
     {   // empty
@@ -119,7 +120,7 @@ static void test_lpf_parse_need_more() {
 }
 
 static void test_lpf_parse_emit_and_second_record() {
-    BlockPool pool(/*block_size=*/3);   // tiny: prefixes and bodies straddle blocks
+    HeapBlockPool pool(/*block_size=*/3);   // tiny: prefixes and bodies straddle blocks
     LengthPrefixedFramer f;
 
     auto r1 = record(10, 0);
@@ -172,7 +173,7 @@ static void test_lpf_write_header_roundtrip() {
     CHECK(std::to_integer<int>(h[3]) == 0x00);
 
     // header written by write_header parses back to the same length
-    BlockPool pool(64);
+    HeapBlockPool pool(64);
     std::vector<std::byte> framed(h, h + 4);
     framed.resize(4 + 513);
     BlockChain c; fill_chain(c, pool, framed, 64);
@@ -182,7 +183,7 @@ static void test_lpf_write_header_roundtrip() {
 }
 
 static void test_passthrough() {
-    BlockPool pool(/*block_size=*/16);
+    HeapBlockPool pool(/*block_size=*/16);
     std::vector<std::byte> raw;         // no framing header for passthrough
     for (int i = 0; i < 50; ++i) raw.push_back(std::byte(static_cast<std::uint8_t>(i)));
     BlockChain chain;

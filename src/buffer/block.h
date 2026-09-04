@@ -10,6 +10,7 @@
 namespace taps {
 
 class BlockPool;
+class HeapBlockPool;
 
 // ============================================================================
 // DataBlock
@@ -48,6 +49,11 @@ public:
 
 private:
     friend class BlockPool;
+    // next_free_ is an intrusive link for a free-list-based strategy; only a
+    // strategy that actually keeps one needs it. HeapBlockPool is the only one
+    // today — a future arena/pmr strategy that doesn't use a free list wouldn't
+    // need this friendship at all.
+    friend class HeapBlockPool;
 
     BlockPool*                   pool_;                  // nullptr detaches the block
     std::atomic<std::uint32_t>   refcount_{0};

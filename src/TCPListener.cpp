@@ -15,10 +15,11 @@ namespace taps {
 
 TCPListener::TCPListener(asio::io_context& ctx, LocalEndpoint local,
                         TransportProperties properties,
-                        SecurityParameters security)
-        : io_context_(ctx), acceptor_(ctx){
+                        SecurityParameters security,
+                        std::shared_ptr<BlockPoolFactory> pool_factory)
+        : io_context_(ctx), acceptor_(ctx), pool_factory_(std::move(pool_factory)){
             local_endpoint_ = std::move(local);
-            transport_properties_ = std::move(properties); 
+            transport_properties_ = std::move(properties);
             security_parameters_ = std::move(security);
         }
     
@@ -78,7 +79,7 @@ asio::awaitable<Result<void>> TCPListener::listen() {
             auto socket = co_await acceptor_.async_accept(asio::use_awaitable);
             
             // Create connection from accepted socket
-            auto connection = std::make_unique<TCPConnection>(std::move(socket));
+            auto connection = std::make_unique<TCPConnection>(std::move(socket), pool_factory_);
             
             co_return std::unique_ptr<Connection>(std::move(connection));
             

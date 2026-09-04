@@ -32,6 +32,7 @@ class MessageFramer;
 class BlockChain;  // src/buffer/block_chain.h — receive-path substrate (private)
 class BlockPool;   // src/buffer/block_pool.h  — receive-path substrate (private)
 class BlockRef;    // src/buffer/block.h       — receive-path substrate (private)
+class BlockPoolFactory;
 class Connection;
 class Listener;
 class Preconnection;
@@ -400,18 +401,20 @@ protected:
 class Preconnection {
 public:
     Preconnection(asio::io_context& ctx, LocalEndpoint local, RemoteEndpoint remote,
-                 TransportProperties props, SecurityParameters security)
-        : io_context_(ctx), local_endpoint_(std::move(local)), 
+                 TransportProperties props, SecurityParameters security,
+                 std::shared_ptr<BlockPoolFactory> pool_factory = nullptr)
+        : io_context_(ctx), local_endpoint_(std::move(local)),
           transport_properties_(std::move(props)),
-          security_parameters_(std::move(security)) { 
+          security_parameters_(std::move(security)),
+          pool_factory_(std::move(pool_factory)) {
             remote_endpoints_.push_back(std::move(remote)); }
-    
+
     asio::awaitable<Result<std::unique_ptr<Connection>>> initiate();
-    
+
     void add_remote_endpoint(RemoteEndpoint endpoint) {
         remote_endpoints_.push_back(std::move(endpoint));
     }
-    
+
     void set_transport_property(PropertyKey key, SelectionProperty value) {
         transport_properties_.set(key, value);
     }
@@ -423,10 +426,30 @@ private:
     std::vector<RemoteEndpoint> remote_endpoints_;
     TransportProperties transport_properties_;
     SecurityParameters security_parameters_;
-    
+    std::shared_ptr<BlockPoolFactory> pool_factory_;
+
     asio::awaitable<Result<std::unique_ptr<Connection>>> initiate_with_single_endpoint();
     asio::awaitable<Result<std::unique_ptr<Connection>>> happy_eyeballs_racing();
     asio::awaitable<Result<std::unique_ptr<Connection>>> race_connections(const std::vector<asio::ip::tcp::endpoint>& endpoints);
+};
+
+// A pluggable strategy for how each Connection obtains its receive-path
+// BlockPool — the injection point ACE would call an allocator strategy.
+// TransportServices owns one and threads it through every Preconnection /
+// Listener / Connection it creates, so an app that needs e.g. a pre-warmed,
+// bounded pool (no `new` once traffic starts — see HeapBlockPool's own
+// lazy-growth caveat) supplies one factory, once, instead of reaching into
+// every Connection subclass individually.
+//
+// make() is called once per Connection (or once per Listener, for the single
+// shared pool behind UDPListener) — never on the per-message hot path — so a
+// factory holding config (block size, pre-warm count, ...) and no other mutable
+// state is safe to share (shared_ptr) across everything TransportServices
+// spawns, without synchronization of its own.
+class BlockPoolFactory {
+public:
+    virtual ~BlockPoolFactory() = default;
+    virtual std::unique_ptr<BlockPool> make() const = 0;
 };
 
 // ============================================================================
@@ -435,21 +458,26 @@ private:
 
 class TransportServices {
 public:
-    explicit TransportServices(asio::io_context& ctx) : io_context_(ctx) {}
-    
+    // pool_factory: nullptr (the default) keeps today's behaviour — every
+    // Connection gets its own HeapBlockPool. Supply one to override how ALL
+    // Connections spawned from this TransportServices obtain their pool.
+    explicit TransportServices(asio::io_context& ctx,
+                               std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+
     Preconnection preconnect(LocalEndpoint local, RemoteEndpoint remote,
                            TransportProperties properties = {},
                            SecurityParameters security = {}) {
         return Preconnection(io_context_, std::move(local), std::move(remote),
-                           std::move(properties), std::move(security));
+                           std::move(properties), std::move(security), pool_factory_);
     }
-    
+
     asio::awaitable<Result<std::unique_ptr<Listener>>> listen(
         LocalEndpoint local, TransportProperties properties = {},
         SecurityParameters security = {});
 
 private:
     asio::io_context& io_context_;
+    std::shared_ptr<BlockPoolFactory> pool_factory_;
 };
 
 // ============================================================================
@@ -458,8 +486,10 @@ private:
 
 class TCPConnection : public Connection {
 public:
-    explicit TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint);
-    explicit TCPConnection(asio::ip::tcp::socket socket);
+    explicit TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint,
+                           std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+    explicit TCPConnection(asio::ip::tcp::socket socket,
+                           std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
     ~TCPConnection();  // out-of-line: block_pool_ is a pimpl to a private type
 
     asio::awaitable<Result<void>> send(const Message& message) override;
@@ -538,7 +568,8 @@ private:
 class ActiveUDPConnection : public Connection {
 public:
 
-    explicit ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::endpoint endpoint);
+    explicit ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::endpoint endpoint,
+                                 std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
     ~ActiveUDPConnection();  // out-of-line: block_pool_ points to a private type
 
     asio::awaitable<Result<void>> send(const Message& message) override;
@@ -560,26 +591,30 @@ class TCPListener : public Listener {
 public:
     explicit TCPListener(asio::io_context& ctx, LocalEndpoint local,
                         TransportProperties properties = {},
-                        SecurityParameters security = {});
-    
+                        SecurityParameters security = {},
+                        std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+
     asio::awaitable<Result<void>> listen() override;
     asio::awaitable<Result<std::unique_ptr<Connection>>> accept() override;
     asio::awaitable<Result<void>> stop() override;
 
     bool is_listening() const noexcept;
-    
+
     LocalEndpoint get_local_endpoint() const;
 
 private:
     asio::io_context& io_context_;
     asio::ip::tcp::acceptor acceptor_;
+    // Forwarded to each TCPConnection accept() spawns; see BlockPoolFactory.
+    std::shared_ptr<BlockPoolFactory> pool_factory_;
 };
 
 class UDPListener : public Listener {
 public:
     explicit UDPListener(asio::io_context& ctx, LocalEndpoint local,
                         TransportProperties properties = {},
-                        SecurityParameters security = {});
+                        SecurityParameters security = {},
+                        std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
     ~UDPListener();  // out-of-line: block_pool_ points to a private type
 
     asio::awaitable<Result<void>> listen() override;

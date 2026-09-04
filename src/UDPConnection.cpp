@@ -3,6 +3,7 @@
 #include "taps/message_framer.h"
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
+#include "buffer/heap_block_pool.h"
 #include <asio/co_spawn.hpp>
 #include <asio/use_awaitable.hpp>
 #include <algorithm>
@@ -114,9 +115,10 @@ std::size_t PassiveUDPConnection::datagrams_dropped() const noexcept {
 // ActiveUDPConnection Implementation
 // ============================================================================
 
-ActiveUDPConnection::ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::endpoint endpoint)
+ActiveUDPConnection::ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::endpoint endpoint,
+                                         std::shared_ptr<BlockPoolFactory> pool_factory)
     : socket_(ctx), remote_endpoint_(endpoint),
-      block_pool_(std::make_unique<BlockPool>()) {
+      block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()) {
     state_ = ConnectionState::ESTABLISHING;
 }
 

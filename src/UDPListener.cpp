@@ -2,6 +2,7 @@
 #include "taps/mailbox.h"
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
+#include "buffer/heap_block_pool.h"
 #include <asio/co_spawn.hpp>
 #include <asio/error.hpp>
 #include <asio/redirect_error.hpp>
@@ -56,12 +57,13 @@ UDPListener::UDPListener(
     asio::io_context& ctx,
     LocalEndpoint local,
     TransportProperties properties,
-    SecurityParameters security)
+    SecurityParameters security,
+    std::shared_ptr<BlockPoolFactory> pool_factory)
 : io_context_(ctx)
 , socket_(ctx)
 , strand_(asio::make_strand(ctx))
 , accept_channel_(io_context_.get_executor(), 100)
-, block_pool_(std::make_unique<BlockPool>())
+, block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>())
 , sweep_timer_(strand_)
 {
     local_endpoint_       = std::move(local);

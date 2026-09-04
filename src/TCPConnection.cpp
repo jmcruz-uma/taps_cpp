@@ -4,6 +4,7 @@
 #include "buffer/block.h"
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
+#include "buffer/heap_block_pool.h"
 #include <asio/use_awaitable.hpp>
 #include <asio/redirect_error.hpp>
 #include <asio/error.hpp>
@@ -22,16 +23,20 @@ namespace taps {
 // TCP Connection Implementation
 // ============================================================================
 
-    TCPConnection::TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint)
-        : socket_(ctx), block_pool_(std::make_unique<BlockPool>()),
+    TCPConnection::TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint,
+                                 std::shared_ptr<BlockPoolFactory> pool_factory)
+        : socket_(ctx),
+          block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()),
           receive_chain_(std::make_unique<BlockChain>()),
           current_block_(std::make_unique<BlockRef>()){
             remote_endpoint_ = endpoint;
     }
 
     // Constructor for accepted connections
-    TCPConnection::TCPConnection(asio::ip::tcp::socket socket)
-        : socket_(std::move(socket)), block_pool_(std::make_unique<BlockPool>()),
+    TCPConnection::TCPConnection(asio::ip::tcp::socket socket,
+                                 std::shared_ptr<BlockPoolFactory> pool_factory)
+        : socket_(std::move(socket)),
+          block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()),
           receive_chain_(std::make_unique<BlockChain>()),
           current_block_(std::make_unique<BlockRef>()) {
         state_ = ConnectionState::ESTABLISHED;

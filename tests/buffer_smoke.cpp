@@ -4,6 +4,7 @@
 
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
+#include "buffer/heap_block_pool.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -36,7 +37,7 @@ static BlockRef make_filled(BlockPool& pool, std::size_t n, std::uint8_t seed) {
 }
 
 static void test_pool_acquire_release() {
-    BlockPool pool(/*block_size=*/4096);
+    HeapBlockPool pool(/*block_size=*/4096);
     CHECK(pool.block_size() == 4096);
     CHECK(pool.live_blocks() == 0);
     CHECK(pool.free_blocks() == 0);
@@ -54,7 +55,7 @@ static void test_pool_acquire_release() {
 }
 
 static void test_pool_recycles_same_storage() {
-    BlockPool pool(4096);
+    HeapBlockPool pool(4096);
     DataBlock* first = nullptr;
     {
         BlockRef a = pool.acquire();
@@ -70,7 +71,7 @@ static void test_pool_recycles_same_storage() {
 }
 
 static void test_blockref_shared_ownership() {
-    BlockPool pool(4096);
+    HeapBlockPool pool(4096);
     BlockRef a = pool.acquire();
     CHECK(a.block()->use_count() == 1);
     {
@@ -86,7 +87,7 @@ static void test_blockref_shared_ownership() {
 }
 
 static void test_free_list_cap() {
-    BlockPool pool(/*block_size=*/1024, /*max_free_blocks=*/2);
+    HeapBlockPool pool(/*block_size=*/1024, /*max_free_blocks=*/2);
     {
         BlockRef r0 = pool.acquire();
         BlockRef r1 = pool.acquire();
@@ -100,7 +101,7 @@ static void test_free_list_cap() {
 }
 
 static void test_live_cap_backpressure() {
-    BlockPool pool(/*block_size=*/1024, /*max_free_blocks=*/8, /*max_live_blocks=*/3);
+    HeapBlockPool pool(/*block_size=*/1024, /*max_free_blocks=*/8, /*max_live_blocks=*/3);
     BlockRef r0 = pool.acquire();
     BlockRef r1 = pool.acquire();
     BlockRef r2 = pool.acquire();
@@ -118,7 +119,7 @@ static void test_live_cap_backpressure() {
 }
 
 static void test_chain_append_and_linearize() {
-    BlockPool pool(/*block_size=*/64);
+    HeapBlockPool pool(/*block_size=*/64);
     BlockChain chain;
     CHECK(chain.empty());
 
@@ -141,7 +142,7 @@ static void test_chain_append_and_linearize() {
 }
 
 static void test_chain_consume_front() {
-    BlockPool pool(/*block_size=*/64, /*max_free_blocks=*/8);
+    HeapBlockPool pool(/*block_size=*/64, /*max_free_blocks=*/8);
     BlockChain chain;
     chain.append(make_filled(pool, 64, 0));
     chain.append(make_filled(pool, 64, 64));
@@ -179,7 +180,7 @@ static void test_chain_consume_front() {
 }
 
 static void test_chain_first_slice() {
-    BlockPool pool(/*block_size=*/16, /*max_free_blocks=*/8);
+    HeapBlockPool pool(/*block_size=*/16, /*max_free_blocks=*/8);
     BlockChain chain;
     chain.append(make_filled(pool, 16, 0));      // stream [0,16)
     chain.append(make_filled(pool, 16, 16));     // stream [16,32)

@@ -34,7 +34,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
     if (transport_properties_.requires_reliable_transport()) {
         // Use TCP
         try {
-            auto tcp_conn = std::make_unique<TCPConnection>(io_context_, endpoint);
+            auto tcp_conn = std::make_unique<TCPConnection>(io_context_, endpoint, pool_factory_);
 
             auto conn_result = co_await tcp_conn->connect();
             
@@ -47,7 +47,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
         asio::ip::udp::endpoint udp_endpoint(endpoint.address(), endpoint.port());
         
         try {
-            auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint);
+            auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint, pool_factory_);
 
             co_return std::unique_ptr<Connection>(std::move(udp_conn));
         } catch (const std::exception& e) {
@@ -104,7 +104,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::race_connect
     
     // Crear todas las conexiones
     for (const auto& endpoint : endpoints) {
-        connections.push_back(std::make_unique<TCPConnection>(io_context_, endpoint));
+        connections.push_back(std::make_unique<TCPConnection>(io_context_, endpoint, pool_factory_));
     }
     
     try {

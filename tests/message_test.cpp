@@ -8,6 +8,7 @@
 
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
+#include "buffer/heap_block_pool.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -85,7 +86,7 @@ static void test_span_variant() {
 }
 
 static void test_chain_as_bytes() {
-    BlockPool pool(/*block_size=*/16);
+    HeapBlockPool pool(/*block_size=*/16);
     const std::string s = "the quick brown fox jumps over the lazy dog, twice.";
     auto chain = make_chain(pool, s, 16);
     CHECK(chain->block_count() >= 3);
@@ -104,7 +105,7 @@ static void test_chain_as_bytes() {
 }
 
 static void test_chain_blocks_zero_copy() {
-    BlockPool pool(/*block_size=*/16);
+    HeapBlockPool pool(/*block_size=*/16);
     const std::string s(70, '\0');
     std::string filled = s;
     for (std::size_t i = 0; i < filled.size(); ++i)
@@ -127,7 +128,7 @@ static void test_chain_blocks_zero_copy() {
 }
 
 static void test_chain_single_block_no_copy() {
-    BlockPool pool(/*block_size=*/64);
+    HeapBlockPool pool(/*block_size=*/64);
     const std::string s = "fits in one block";
     auto chain = make_chain(pool, s, 64);
     CHECK(chain->block_count() == 1);
@@ -141,7 +142,7 @@ static void test_chain_single_block_no_copy() {
 }
 
 static void test_free_copy() {
-    BlockPool pool(/*block_size=*/8);
+    HeapBlockPool pool(/*block_size=*/8);
     const std::string s = "assemble me into a caller buffer";
     auto chain = make_chain(pool, s, 8);
     Message chained(chain);
@@ -160,7 +161,7 @@ static void test_free_copy() {
 }
 
 static void test_chain_partial() {
-    BlockPool pool(/*block_size=*/32);
+    HeapBlockPool pool(/*block_size=*/32);
     const std::string s = "fragment without end";
     auto chain = make_chain(pool, s, 32);
 
@@ -172,7 +173,7 @@ static void test_chain_partial() {
 }
 
 static void test_chain_blocks_released_with_message() {
-    BlockPool pool(/*block_size=*/16);
+    HeapBlockPool pool(/*block_size=*/16);
     const std::string s(200, 'x');
     CHECK(pool.live_blocks() == 0);
     {
