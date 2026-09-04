@@ -4,10 +4,88 @@
 #include "buffer/block_chain.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 
 namespace taps {
+
+namespace {
+
+// Decodes a big-/little-endian length field. Standard widths (2, 4, 8 bytes) go
+// through a memcpy + std::byteswap (C++23); other widths (an unusual choice, but
+// the constructor allows 1..8) fall back to the byte-at-a-time loop.
+std::uint64_t decode_length(const std::byte* hdr, std::size_t field_size, std::endian order) {
+    switch (field_size) {
+        case 2: {
+            std::uint16_t v;
+            std::memcpy(&v, hdr, sizeof(v));
+            if (order != std::endian::native) v = std::byteswap(v);
+            return v;
+        }
+        case 4: {
+            std::uint32_t v;
+            std::memcpy(&v, hdr, sizeof(v));
+            if (order != std::endian::native) v = std::byteswap(v);
+            return v;
+        }
+        case 8: {
+            std::uint64_t v;
+            std::memcpy(&v, hdr, sizeof(v));
+            if (order != std::endian::native) v = std::byteswap(v);
+            return v;
+        }
+        default: {
+            std::uint64_t length = 0;
+            if (order == std::endian::big) {
+                for (std::size_t i = 0; i < field_size; ++i)
+                    length = (length << 8) | std::to_integer<std::uint64_t>(hdr[i]);
+            } else {
+                for (std::size_t i = 0; i < field_size; ++i)
+                    length |= std::to_integer<std::uint64_t>(hdr[i]) << (i * 8);
+            }
+            return length;
+        }
+    }
+}
+
+// Inverse of decode_length: writes `length` into `out[0, field_size)`.
+void encode_length(std::uint64_t length, std::byte* out, std::size_t field_size, std::endian order) {
+    switch (field_size) {
+        case 2: {
+            auto v = static_cast<std::uint16_t>(length);
+            if (order != std::endian::native) v = std::byteswap(v);
+            std::memcpy(out, &v, sizeof(v));
+            return;
+        }
+        case 4: {
+            auto v = static_cast<std::uint32_t>(length);
+            if (order != std::endian::native) v = std::byteswap(v);
+            std::memcpy(out, &v, sizeof(v));
+            return;
+        }
+        case 8: {
+            std::uint64_t v = length;
+            if (order != std::endian::native) v = std::byteswap(v);
+            std::memcpy(out, &v, sizeof(v));
+            return;
+        }
+        default: {
+            if (order == std::endian::big) {
+                for (std::size_t i = 0; i < field_size; ++i) {
+                    const unsigned shift = static_cast<unsigned>((field_size - 1 - i) * 8);
+                    out[i] = static_cast<std::byte>((length >> shift) & 0xFF);
+                }
+            } else {
+                for (std::size_t i = 0; i < field_size; ++i)
+                    out[i] = static_cast<std::byte>((length >> (i * 8)) & 0xFF);
+            }
+            return;
+        }
+    }
+}
+
+}  // namespace
 
 // ----------------------------------------------------------------------------
 // ReceiveCursor
@@ -71,15 +149,7 @@ ParseResult LengthPrefixedFramer::parse(const ReceiveCursor& cursor, bool /*at_e
 
     std::byte hdr[8];
     cursor.copy_out(0, std::span<std::byte>(hdr, length_field_size_));
-
-    std::uint64_t length = 0;
-    if (byte_order_ == std::endian::big) {
-        for (std::size_t i = 0; i < length_field_size_; ++i)
-            length = (length << 8) | std::to_integer<std::uint64_t>(hdr[i]);
-    } else {
-        for (std::size_t i = 0; i < length_field_size_; ++i)
-            length |= std::to_integer<std::uint64_t>(hdr[i]) << (i * 8);
-    }
+    const std::uint64_t length = decode_length(hdr, length_field_size_, byte_order_);
 
     const std::size_t total = length_field_size_ + static_cast<std::size_t>(length);
     if (avail < total)
@@ -91,16 +161,7 @@ ParseResult LengthPrefixedFramer::parse(const ReceiveCursor& cursor, bool /*at_e
 
 std::size_t LengthPrefixedFramer::write_header(const Message& msg,
                                                std::span<std::byte> out) {
-    const std::uint64_t length = msg.size();
-    if (byte_order_ == std::endian::big) {
-        for (std::size_t i = 0; i < length_field_size_; ++i) {
-            const unsigned shift = static_cast<unsigned>((length_field_size_ - 1 - i) * 8);
-            out[i] = static_cast<std::byte>((length >> shift) & 0xFF);
-        }
-    } else {
-        for (std::size_t i = 0; i < length_field_size_; ++i)
-            out[i] = static_cast<std::byte>((length >> (i * 8)) & 0xFF);
-    }
+    encode_length(msg.size(), out.data(), length_field_size_, byte_order_);
     return length_field_size_;
 }
 

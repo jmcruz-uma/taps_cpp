@@ -12,6 +12,14 @@ namespace taps {
 // only forward-declares it so the block substrate stays private to src/.
 
 std::span<const std::byte> Message::ensure_gathered() const {
+    // A record that arrived wholly inside one pooled block is already contiguous:
+    // view it in place (the block stays alive as long as chain_, i.e. as long as
+    // this Message) instead of paying a second copy into a fresh allocation.
+    // Recomputed each call — block_count() and bytes() are both O(1), no upside
+    // to caching a decision this cheap.
+    if (chain_ && chain_->block_count() == 1)
+        return chain_->begin()->bytes();
+
     if (!gathered_valid_) {
         const std::size_t n = chain_ ? chain_->size() : 0;
         // new[] (not make_shared) leaves the bytes uninitialised — we overwrite

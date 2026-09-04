@@ -1,6 +1,7 @@
 
 #include "taps/taps_api.h"
 #include "taps/message_framer.h"
+#include "buffer/block.h"
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
 #include <asio/use_awaitable.hpp>
@@ -23,14 +24,16 @@ namespace taps {
 
     TCPConnection::TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint)
         : socket_(ctx), block_pool_(std::make_unique<BlockPool>()),
-          receive_chain_(std::make_unique<BlockChain>()){
+          receive_chain_(std::make_unique<BlockChain>()),
+          current_block_(std::make_unique<BlockRef>()){
             remote_endpoint_ = endpoint;
     }
 
     // Constructor for accepted connections
     TCPConnection::TCPConnection(asio::ip::tcp::socket socket)
         : socket_(std::move(socket)), block_pool_(std::make_unique<BlockPool>()),
-          receive_chain_(std::make_unique<BlockChain>()) {
+          receive_chain_(std::make_unique<BlockChain>()),
+          current_block_(std::make_unique<BlockRef>()) {
         state_ = ConnectionState::ESTABLISHED;
         
         // Cache endpoints
@@ -188,6 +191,44 @@ namespace taps {
 
 
     
+    // See the declaration in taps_api.h for the reuse policy. current_block_ is
+    // kept positioned at an empty window [next_write, next_write) between calls;
+    // each delivered chunk is a separate BlockRef sharing the same DataBlock, so
+    // several deliveries can live off one pooled block without copying.
+    asio::awaitable<Result<BlockRef>> TCPConnection::read_one_chunk() {
+        const std::size_t reuse_threshold = block_pool_->block_size() / 4;
+
+        if (!*current_block_ || current_block_->capacity_after_begin() < reuse_threshold) {
+            *current_block_ = block_pool_->acquire();
+            if (!*current_block_) {
+                co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED,
+                                                    "receive block pool exhausted"});
+            }
+        }
+
+        asio::error_code ec;
+        const std::size_t n = co_await socket_.async_read_some(
+            asio::buffer(current_block_->writable_data(), current_block_->capacity_after_begin()),
+            asio::redirect_error(asio::use_awaitable, ec));
+
+        if (ec == asio::error::eof) {
+            receive_eof_ = true;
+            co_return BlockRef{};   // no bytes this round; caller checks receive_eof_
+        }
+        if (ec) {
+            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, ec.message()});
+        }
+
+        const std::size_t begin = current_block_->begin_offset();
+        BlockRef delivered(current_block_->block(), begin, begin + n);  // shares the DataBlock
+        current_block_->set_range(begin + n, begin + n);                // reposition, still empty
+
+        if (current_block_->capacity_after_begin() < reuse_threshold)
+            current_block_->reset();   // stop reusing; `delivered` keeps the block alive as needed
+
+        co_return delivered;
+    }
+
     asio::awaitable<Result<Message>> TCPConnection::receive_with_framing() {
         // RFC 9623 Section 6: the framer parses records out of a receive cursor
         // over the accumulated-but-unparsed bytes (receive_chain_). Each Emit is
@@ -216,57 +257,37 @@ namespace taps {
                                   /*end_of_message=*/true);
             }
 
-            BlockRef block = block_pool_->acquire();
-            asio::error_code ec;
-            std::size_t n = co_await socket_.async_read_some(
-                asio::buffer(block.writable_data(), block.capacity_after_begin()),
-                asio::redirect_error(asio::use_awaitable, ec));
-
-            if (ec == asio::error::eof) {
-                receive_eof_ = true;
-                continue;
-            }
-            if (ec) {
+            auto chunk = co_await read_one_chunk();
+            if (!chunk) {
                 state_ = ConnectionState::ERROR;
-                co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, ec.message()});
+                co_return std::unexpected(chunk.error());
             }
-            if (n > 0) {
-                block.set_range(0, n);
-                receive_chain_->append(std::move(block));
-            }
+            if (*chunk)
+                receive_chain_->append(std::move(*chunk));
+            // Otherwise read_one_chunk() hit EOF (receive_eof_ is now set); loop
+            // back so parse() is asked again with at_eof=true.
         }
     }
-    
+
     asio::awaitable<Result<Message>> TCPConnection::receive_without_framing() {
         // Mode D — RFC 9622 Section 9.3.2.2 (ReceivedPartial). With no Framer the
         // whole connection is one Message of indeterminate length: deliver each
-        // chunk as it arrives in a pooled block, with is_end_of_message() bound to
-        // the peer's half-close. No accumulation; memory stays bounded for any
-        // transfer size. Blocks recycle through block_pool_'s free list, so the
-        // steady state does no allocation and no zero-fill.
-        BlockRef block = block_pool_->acquire();
-
-        asio::error_code ec;
-        std::size_t n = co_await socket_.async_read_some(
-            asio::buffer(block.writable_data(), block.capacity_after_begin()),
-            asio::redirect_error(asio::use_awaitable, ec));
-
-        if (ec == asio::error::eof) {
+        // chunk as it arrives, with is_end_of_message() bound to the peer's
+        // half-close. No accumulation; memory stays bounded for any transfer size.
+        auto chunk = co_await read_one_chunk();
+        if (!chunk) {
+            state_ = ConnectionState::ERROR;
+            co_return std::unexpected(chunk.error());
+        }
+        if (!*chunk) {
             // Graceful close: final fragment, empty, endOfMessage = true.
             state_ = ConnectionState::CLOSED;
             co_return Message(std::make_shared<BlockChain>(), MessageContext{},
                               /*end_of_message=*/true);
         }
-        if (ec) {
-            state_ = ConnectionState::ERROR;
-            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, ec.message()});
-        }
 
         auto chain = std::make_shared<BlockChain>();
-        if (n > 0) {
-            block.set_range(0, n);
-            chain->append(std::move(block));
-        }
+        chain->append(std::move(*chunk));
         co_return Message(std::move(chain), MessageContext{}, /*end_of_message=*/false);
     }
 

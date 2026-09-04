@@ -1,7 +1,8 @@
 // Tests for the Message byte-access API: the vector / span variants stay cheap,
 // the chain-backed variant reports size / endOfMessage, exposes its blocks with
-// zero copy, assembles contiguously on demand via as_bytes(), and copies into a
-// caller buffer via taps::gather(). Blocks are released with the Message.
+// zero copy, and assembles contiguously on demand via as_bytes() — a free view
+// when the record already lives in one pooled block, a copy otherwise — plus a
+// copy into a caller buffer via taps::gather(). Blocks are released with the Message.
 
 #include "taps/taps_api.h"
 
@@ -125,6 +126,20 @@ static void test_chain_blocks_zero_copy() {
     CHECK(off == filled.size());
 }
 
+static void test_chain_single_block_no_copy() {
+    BlockPool pool(/*block_size=*/64);
+    const std::string s = "fits in one block";
+    auto chain = make_chain(pool, s, 64);
+    CHECK(chain->block_count() == 1);
+
+    Message m(chain);
+    CHECK(bytes_equal(m.as_bytes(), s));
+
+    // A single-block record is viewed in place, not recollected: as_bytes()
+    // must return the very same address as the block's own storage.
+    CHECK(m.as_bytes().data() == chain->begin()->bytes().data());
+}
+
 static void test_free_copy() {
     BlockPool pool(/*block_size=*/8);
     const std::string s = "assemble me into a caller buffer";
@@ -179,6 +194,7 @@ int main() {
     test_span_variant();
     test_chain_as_bytes();
     test_chain_blocks_zero_copy();
+    test_chain_single_block_no_copy();
     test_free_copy();
     test_chain_partial();
     test_chain_blocks_released_with_message();

@@ -31,6 +31,7 @@ class MessageContext;
 class MessageFramer;
 class BlockChain;  // src/buffer/block_chain.h — receive-path substrate (private)
 class BlockPool;   // src/buffer/block_pool.h  — receive-path substrate (private)
+class BlockRef;    // src/buffer/block.h       — receive-path substrate (private)
 class Connection;
 class Listener;
 class Preconnection;
@@ -484,9 +485,24 @@ private:
     // Bytes received but not yet parsed by the framer, behind the receive cursor.
     std::unique_ptr<BlockChain> receive_chain_;
     bool receive_eof_ = false;
+    // The block read_one_chunk() is currently filling; may be invalid (no block
+    // checked out). Kept across calls so a small read doesn't strand the rest of
+    // a block's capacity — see read_one_chunk().
+    std::unique_ptr<BlockRef> current_block_;
 
     asio::awaitable<Result<Message>> receive_with_framing();
     asio::awaitable<Result<Message>> receive_without_framing();
+
+    // Reads the next chunk of the byte-stream into a pooled block, reusing
+    // current_block_'s leftover capacity across calls instead of checking out a
+    // fresh block every time (a fresh block is preferred once the leftover space
+    // drops below a quarter of the pool's block size, so a later read doesn't get
+    // starved into an extra syscall). Each call's bytes are delivered as their own
+    // refcounted window; several such windows may share one DataBlock. Returns an
+    // empty/invalid BlockRef on a graceful close (receive_eof_ is set as a side
+    // effect) — used identically by receive_with_framing() and
+    // receive_without_framing(), so the block-reuse policy lives in one place.
+    asio::awaitable<Result<BlockRef>> read_one_chunk();
 };
 
 
