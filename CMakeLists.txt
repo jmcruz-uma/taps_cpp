@@ -15,15 +15,24 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra -DASIO_STANDALONE")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -DASIO_STANDALONE")
 
 # CONFIGURACIÓN DE ASIO STANDALONE
-# Ruta específica del usuario ASIO
-set(ASIO_INCLUDE_DIR "/home/alumno/libs/asio/asio/include" CACHE PATH "Path to ASIO standalone headers")
+# Set ASIO_INCLUDE_DIR yourself to reuse an existing checkout; otherwise (the
+# default) standalone ASIO is fetched automatically, so a fresh clone of this
+# repo builds with no manual setup on any machine.
+set(ASIO_INCLUDE_DIR "" CACHE PATH "Path to ASIO standalone headers (leave empty to fetch automatically)")
+option(TAPS_FETCH_ASIO "Fetch standalone ASIO via FetchContent when ASIO_INCLUDE_DIR isn't set" ON)
 
-# Opción alternativa: Variable de entorno (más flexible para otros usuarios)
-# set(ASIO_INCLUDE_DIR "$ENV{ASIO_ROOT}/include" CACHE PATH "Path to ASIO standalone headers")
-
-# Verificar que ASIO existe
-if(NOT EXISTS "${ASIO_INCLUDE_DIR}/asio.hpp")
-    message(FATAL_ERROR "ASIO not found at ${ASIO_INCLUDE_DIR}. Please set ASIO_INCLUDE_DIR to the correct path.")
+if(ASIO_INCLUDE_DIR STREQUAL "" OR NOT EXISTS "${ASIO_INCLUDE_DIR}/asio.hpp")
+    if(NOT TAPS_FETCH_ASIO)
+        message(FATAL_ERROR "ASIO not found at '${ASIO_INCLUDE_DIR}'. Set ASIO_INCLUDE_DIR to an existing checkout, or enable TAPS_FETCH_ASIO.")
+    endif()
+    include(FetchContent)
+    FetchContent_Declare(asio_standalone
+        GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+        GIT_TAG asio-1-30-2
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(asio_standalone)
+    set(ASIO_INCLUDE_DIR "${asio_standalone_SOURCE_DIR}/asio/include" CACHE PATH
+        "Path to ASIO standalone headers" FORCE)
 endif()
 
 message(STATUS "Using ASIO from: ${ASIO_INCLUDE_DIR}")
@@ -34,7 +43,14 @@ include_directories(${ASIO_INCLUDE_DIR})
 
 # Agregar subdirectorios
 add_subdirectory(src)        # Biblioteca TAPS
-add_subdirectory(examples)   # Ejemplos
+
+# Examples: opt-out (-DTAPS_BUILD_EXAMPLES=OFF), e.g. when this project is
+# pulled in via FetchContent by a consumer that only wants TAPS::static and
+# would otherwise collide with its own tcpserver/tcpclient targets.
+option(TAPS_BUILD_EXAMPLES "Build TAPS examples" ON)
+if(TAPS_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
 
 # Tests unitarios: opt-in (-DTAPS_BUILD_TESTS=ON). Off por defecto para que los
 # consumidores que hacen `cmake --build` sin filtrar target no los construyan.
