@@ -6,7 +6,7 @@ add_executable(framer_test  framer_test.cpp)
 
 # The block substrate lives under src/ as private headers.
 foreach(t buffer_smoke message_test framer_test)
-    target_include_directories(${t} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(${t} PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(${t} PRIVATE taps_static)
     if(UNIX AND NOT APPLE)
         target_link_libraries(${t} PRIVATE pthread)

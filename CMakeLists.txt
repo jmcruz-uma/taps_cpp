@@ -38,7 +38,7 @@ endif()
 message(STATUS "Using ASIO from: ${ASIO_INCLUDE_DIR}")
 
 # Directorio donde CMake buscará los headers (incluir ASIO)
-include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${ASIO_INCLUDE_DIR})
 
 # Agregar subdirectorios

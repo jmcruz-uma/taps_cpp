@@ -18,13 +18,13 @@ set_target_properties(taps_static PROPERTIES
     OUTPUT_NAME "taps"           # El archivo se llamará libtaps.a
     VERSION ${PROJECT_VERSION}
     SOVERSION 1
-    PUBLIC_HEADER "${CMAKE_SOURCE_DIR}/include/taps/taps_api.h"
+    PUBLIC_HEADER "${PROJECT_SOURCE_DIR}/include/taps/taps_api.h"
 )
 
 # Directorios de include para esta biblioteca
 target_include_directories(taps_static 
     PUBLIC 
-        ${CMAKE_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/include
         ${ASIO_INCLUDE_DIR}        # ASIO disponible para usuarios de la biblioteca
     PRIVATE 
         ${CMAKE_CURRENT_SOURCE_DIR}
