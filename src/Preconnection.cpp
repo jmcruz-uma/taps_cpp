@@ -1,51 +1,56 @@
 #include "taps/taps_api.h"
-#include <asio/experimental/parallel_group.hpp>
-#include <asio/experimental/awaitable_operators.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/use_awaitable.hpp>
 
-namespace taps{
+#include <string>
+
+namespace taps {
 
 // ============================================================================
 // Preconnection Implementation
 // ============================================================================
+
 asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate() {
-    // Si solo tenemos un endpoint, usar el flujo simple actual
+    // A single remote endpoint takes the direct path; two or more go through
+    // Happy Eyeballs.
     if (remote_endpoints_.size() == 1) {
         co_return co_await initiate_with_single_endpoint();
     }
-    
-    // Happy Eyeballs racing con múltiples endpoints
+
     co_return co_await happy_eyeballs_racing();
 }
 
 
 asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_with_single_endpoint() {
-    // Simple implementation - try direct connection first
     auto asio_endpoints = co_await remote_endpoints_.at(0).resolve(io_context_);
-    
+
     if (asio_endpoints.empty()) {
-        co_return std::unexpected(TAPSError(ErrorType::RESOLUTION_FAILED, 
+        co_return std::unexpected(TAPSError(ErrorType::RESOLUTION_FAILED,
                                           "Failed to resolve remote endpoint"));
     }
-    
-    // For now, just try the first endpoint
+
     auto& endpoint = asio_endpoints[0];
-    
-    // Determine protocol based on transport properties
+
     if (transport_properties_.requires_reliable_transport()) {
-        // Use TCP
+        // TCP
         try {
             auto tcp_conn = std::make_unique<TCPConnection>(io_context_, endpoint, pool_factory_);
 
-            auto conn_result = co_await tcp_conn->connect();
-            
-            co_return std::unique_ptr<Connection>(std::move(tcp_conn));
+            auto connect_result = co_await tcp_conn->connect();
+            if (!connect_result) {
+                co_await tcp_conn->abort();
+                co_return std::unexpected(connect_result.error());
+            }
+
+            co_return co_await establish_connection(
+                std::unique_ptr<Connection>(std::move(tcp_conn)));
         } catch (const std::exception& e) {
             co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, e.what()));
         }
     } else {
-        // Convert TCP endpoint to UDP
+        // UDP: convert the resolved TCP endpoint to a UDP one.
         asio::ip::udp::endpoint udp_endpoint(endpoint.address(), endpoint.port());
-        
+
         try {
             auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint, pool_factory_);
 
@@ -56,113 +61,98 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
     }
 }
 
+
 asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::happy_eyeballs_racing() {
     std::vector<asio::ip::tcp::endpoint> all_endpoints;
-    
-    // Resolver todos los endpoints (remote_endpoint_ + remote_endpoints_)
+
     try {
+        // remote_endpoints_[0] is resolved first so its addresses lead the list
+        // (RFC 8305 keeps the caller's preferred destination first); the rest
+        // follow in order. Index 0 is skipped in the loop to avoid resolving it
+        // twice.
         auto primary_resolved = co_await remote_endpoints_.at(0).resolve(io_context_);
         all_endpoints.insert(all_endpoints.end(), primary_resolved.begin(), primary_resolved.end());
-        
-        for (const auto& remote : remote_endpoints_) {
-            auto resolved = co_await remote.resolve(io_context_);
+
+        for (std::size_t i = 1; i < remote_endpoints_.size(); ++i) {
+            auto resolved = co_await remote_endpoints_[i].resolve(io_context_);
             all_endpoints.insert(all_endpoints.end(), resolved.begin(), resolved.end());
         }
-        
+
         if (all_endpoints.empty()) {
-            co_return std::unexpected(TAPSError(ErrorType::RESOLUTION_FAILED, 
+            co_return std::unexpected(TAPSError(ErrorType::RESOLUTION_FAILED,
                                               "No addresses resolved"));
         }
-        
+
     } catch (const std::exception& e) {
         co_return std::unexpected(TAPSError(ErrorType::RESOLUTION_FAILED, e.what()));
     }
-    
-    // Happy Eyeballs racing
+
     co_return co_await race_connections(all_endpoints);
 }
 
 
-
+/// Happy Eyeballs (RFC 8305) connection attempt over the resolved address list.
+///
+/// Staggered sequential attempts: the first address is tried immediately; each
+/// further address is tried only after the previous attempt has failed, with a
+/// 250 ms pause between attempts (RFC 8305 §5). The first address to connect
+/// wins; every losing attempt is aborted before the next one starts.
+///
+/// Properties: no shared mutable state, no detached coroutines, no polling loop.
+/// Correct and adequate for the common IPv4/IPv6 dual-stack case (1-3 addresses).
+///
+/// Limitation vs. a full RFC 8305 implementation: attempts do not overlap, so a
+/// black-holed address is only abandoned once its own connect() times out rather
+/// than after the 250 ms stagger. True parallel racing would need a timer raced
+/// against each connect() (asio::experimental::parallel_group) with careful
+/// Connection lifetime management across coroutines; deferred until a scenario
+/// needs it.
 asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::race_connections(
     const std::vector<asio::ip::tcp::endpoint>& endpoints) {
-    
+
     using namespace std::chrono_literals;
-    
-    // Shared state para el racing
-    struct RaceState {
-        std::atomic<bool> finished{false};
-        std::mutex winner_mutex;
-        std::unique_ptr<Connection> winner;
-        std::size_t winner_index = 0;
-        TAPSError last_error{ErrorType::CONNECTION_FAILED, "No connections attempted"};
-    };
-    
-    auto race_state = std::make_shared<RaceState>();
-    std::vector<std::unique_ptr<TCPConnection>> connections;
-    connections.reserve(endpoints.size());
-    
-    // Crear todas las conexiones
-    for (const auto& endpoint : endpoints) {
-        connections.push_back(std::make_unique<TCPConnection>(io_context_, endpoint, pool_factory_));
+
+    if (endpoints.empty()) {
+        co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED,
+                                          "No endpoints to connect to"));
     }
-    
-    try {
-        // Lanzar todas las conexiones concurrentemente
-        for (std::size_t i = 0; i < connections.size(); ++i) {
-            asio::co_spawn(io_context_,
-                [race_state, i, conn = std::move(connections[i])]() mutable -> asio::awaitable<void> {
-                    try {
-                        auto connect_result = co_await conn->connect();
-                        
-                        if (connect_result) {
-                            // Intentar ser el ganador
-                            std::lock_guard<std::mutex> lock(race_state->winner_mutex);
-                            if (!race_state->finished.exchange(true)) {
-                                race_state->winner = std::move(conn);
-                                race_state->winner_index = i;
-                            }
-                        } else {
-                            // Actualizar último error
-                            std::lock_guard<std::mutex> lock(race_state->winner_mutex);
-                            race_state->last_error = connect_result.error();
-                        }
-                    } catch (const std::exception& e) {
-                        std::lock_guard<std::mutex> lock(race_state->winner_mutex);
-                        race_state->last_error = TAPSError(ErrorType::CONNECTION_FAILED, e.what());
-                    }
-                    co_return;
-                },
-                asio::detached
-            );
+
+    TAPSError last_error{ErrorType::CONNECTION_FAILED, "No endpoints attempted"};
+
+    for (std::size_t i = 0; i < endpoints.size(); ++i) {
+        auto conn = std::make_unique<TCPConnection>(io_context_, endpoints[i], pool_factory_);
+
+        auto connect_result = co_await conn->connect();
+        if (connect_result) {
+            co_return co_await establish_connection(
+                std::unique_ptr<Connection>(std::move(conn)));
         }
-        
-        // Esperar con timeout
-        auto deadline = std::chrono::steady_clock::now() + 10s;
-        constexpr auto poll_interval = 50ms;
-        
-        while (!race_state->finished.load() && std::chrono::steady_clock::now() < deadline) {
-            auto timer = asio::steady_timer(io_context_);
-            timer.expires_after(poll_interval);
-            co_await timer.async_wait(asio::use_awaitable);
+
+        // Failed: record the error, release this attempt, pause before the next.
+        last_error = connect_result.error();
+        co_await conn->abort();
+
+        if (i + 1 < endpoints.size()) {
+            asio::steady_timer stagger(io_context_, 250ms);
+            co_await stagger.async_wait(asio::use_awaitable);
         }
-        
-        // Verificar resultado
-        {
-            std::lock_guard<std::mutex> lock(race_state->winner_mutex);
-            if (race_state->winner) {
-                co_return std::move(race_state->winner);
-            } else if (std::chrono::steady_clock::now() >= deadline) {
-                co_return std::unexpected(TAPSError(ErrorType::CONNECTION_TIMEOUT,
-                                                  "All connection attempts timed out"));
-            } else {
-                co_return std::unexpected(race_state->last_error);
-            }
-        }
-        
-    } catch (const std::exception& e) {
-        co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, e.what()));
     }
+
+    co_return std::unexpected(TAPSError(ErrorType::CONNECTION_TIMEOUT,
+                                      "All " + std::to_string(endpoints.size()) +
+                                      " connection attempts failed: " + last_error.message()));
 }
 
+
+asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::establish_connection(
+    std::unique_ptr<Connection> conn) {
+    // TLS/security establishment phase hooks in here: when security_parameters_
+    // requests it, construct the security provider and run its handshake over
+    // `conn` (wrap the transport, validate the peer certificate against the
+    // pinned trust anchor, check ALPN); on failure abort `conn` and return the
+    // error. See paper_taps/design/tls_experiment_notes.md (D3/D4). For now the
+    // connection is returned as-is.
+    co_return std::unique_ptr<Connection>(std::move(conn));
 }
+
+} // namespace taps

@@ -431,6 +431,13 @@ private:
     asio::awaitable<Result<std::unique_ptr<Connection>>> initiate_with_single_endpoint();
     asio::awaitable<Result<std::unique_ptr<Connection>>> happy_eyeballs_racing();
     asio::awaitable<Result<std::unique_ptr<Connection>>> race_connections(const std::vector<asio::ip::tcp::endpoint>& endpoints);
+
+    // Post-connect establishment: finalises a freshly connected Connection before
+    // it is handed back to the caller. Today it only forwards ownership; it is the
+    // designated seam for the security/TLS establishment phase (SecurityParameters
+    // -> provider handshake over the winning transport). Both the single-endpoint
+    // path and the Happy Eyeballs winner funnel through here.
+    asio::awaitable<Result<std::unique_ptr<Connection>>> establish_connection(std::unique_ptr<Connection> conn);
 };
 
 // A pluggable strategy for how each Connection obtains its receive-path
