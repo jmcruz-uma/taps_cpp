@@ -5,6 +5,7 @@
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl.hpp>
 
+#include <optional>
 #include <string>
 
 namespace taps {
@@ -27,6 +28,11 @@ public:
     // The ALPN protocol the handshake selected, or "" if none was negotiated.
     // Not const: asio::ssl::stream::native_handle() is non-const.
     std::string negotiated_alpn();
+
+    // The negotiated TLS version / cipher / group / ALPN plus the linked OpenSSL
+    // version, for the harness comparability check. Non-const for the same reason
+    // as negotiated_alpn(). Always engaged once handshake_*() has returned.
+    std::optional<SecurityInfo> security_info() override;
 
     asio::awaitable<Result<std::size_t>> read_some(asio::mutable_buffer buffer) override;
     asio::awaitable<Result<std::size_t>> write(

@@ -193,6 +193,12 @@ namespace taps {
         co_return std::expected<void, TAPSError>{std::in_place};
     }
 
+    // Forwards to the current I/O stream: a PlainStream reports no security, a
+    // TlsStream reports the negotiated parameters. Diagnostic only.
+    std::optional<SecurityInfo> TCPConnection::security_info() {
+        return stream_->security_info();
+    }
+
     // Method to establish connection (called by Preconnection)
     asio::awaitable<Result<void>> TCPConnection::connect() {
         if (state_ != ConnectionState::ESTABLISHING) {

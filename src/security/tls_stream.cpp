@@ -4,6 +4,7 @@
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
 
+#include <openssl/crypto.h>
 #include <openssl/ssl.h>
 
 namespace taps {
@@ -52,6 +53,29 @@ std::string TlsStream::negotiated_alpn() {
     if (proto == nullptr || len == 0)
         return {};
     return std::string(reinterpret_cast<const char*>(proto), len);
+}
+
+std::optional<SecurityInfo> TlsStream::security_info() {
+    ::SSL* ssl = ssl_.native_handle();
+
+    SecurityInfo info;
+    info.openssl_version = ::OpenSSL_version(OPENSSL_VERSION);
+
+    if (const char* v = ::SSL_get_version(ssl))
+        info.tls_version = v;
+
+    if (const ::SSL_CIPHER* cipher = ::SSL_get_current_cipher(ssl)) {
+        if (const char* name = ::SSL_CIPHER_get_name(cipher))
+            info.cipher = name;
+    }
+
+    // SSL_get_negotiated_group() yields the TLS group id of the key-exchange
+    // group; SSL_group_to_name() turns it into "X25519" etc. (null if unknown).
+    if (const char* group = ::SSL_group_to_name(ssl, ::SSL_get_negotiated_group(ssl)))
+        info.group = group;
+
+    info.alpn = negotiated_alpn();
+    return info;
 }
 
 asio::awaitable<Result<std::size_t>> TlsStream::read_some(asio::mutable_buffer buffer) {

@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <span>
 #include <expected>
+#include <optional>
 #include <unordered_map>
 #include <bit>
 
@@ -237,6 +238,21 @@ private:
     TLSVersion max_tls_version_ = TLSVersion::TLS_1_3;
 };
 
+// Diagnostic view of the parameters a secured Connection actually negotiated.
+// Connection::security_info() returns one of these once the TLS handshake has
+// completed, and std::nullopt otherwise (a plain Connection, or one not yet
+// established). It is for logging and for test / benchmark harnesses that must
+// confirm every peer negotiated identical cryptographic parameters; it is not a
+// control surface and nothing on the data path reads it. Every field is the
+// value as OpenSSL reports it, or "" when it does not apply.
+struct SecurityInfo {
+    std::string openssl_version;  // OpenSSL_version(OPENSSL_VERSION) as linked into the library
+    std::string tls_version;      // e.g. "TLSv1.3"
+    std::string cipher;           // e.g. "TLS_AES_128_GCM_SHA256"
+    std::string group;            // key-exchange group, e.g. "X25519"
+    std::string alpn;             // negotiated ALPN protocol id, "" if none
+};
+
 // ============================================================================
 // Endpoints
 // ============================================================================
@@ -451,10 +467,15 @@ public:
     virtual RemoteEndpoint get_remote_endpoint() const = 0;
     virtual LocalEndpoint get_local_endpoint() const = 0;
     ConnectionState state() const noexcept{ return state_; }
-    
+
     virtual void set_framer(std::unique_ptr<MessageFramer> framer){
         framer_ = std::move(framer);
     }
+
+    // The TLS parameters this Connection negotiated, or std::nullopt if it is not
+    // secured. Non-const: reading them goes through asio::ssl::stream, whose
+    // native_handle() has no const overload. Diagnostic only (see SecurityInfo).
+    virtual std::optional<SecurityInfo> security_info() { return std::nullopt; }
 
 protected:
     ConnectionState state_ = ConnectionState::ESTABLISHING;
@@ -585,6 +606,7 @@ public:
     
     RemoteEndpoint get_remote_endpoint() const override;
     LocalEndpoint get_local_endpoint() const override;
+    std::optional<SecurityInfo> security_info() override;
 
     asio::awaitable<Result<void>> connect();
 

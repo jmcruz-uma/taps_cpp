@@ -6,7 +6,9 @@
 #include <asio/buffer.hpp>
 
 #include <cstddef>
+#include <optional>
 #include <span>
+#include <string>
 
 namespace taps {
 
@@ -31,6 +33,10 @@ public:
     // Graceful shutdown of the write direction: a TCP FIN for a PlainStream, a TLS
     // close_notify for a TlsStream.
     virtual asio::awaitable<Result<void>> shutdown() = 0;
+
+    // The negotiated TLS parameters, for diagnostics only (see SecurityInfo). A
+    // PlainStream has none; a TlsStream reports what the handshake settled on.
+    virtual std::optional<SecurityInfo> security_info() { return std::nullopt; }
 };
 
 }  // namespace taps
