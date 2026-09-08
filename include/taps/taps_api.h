@@ -33,6 +33,7 @@ class BlockChain;  // src/buffer/block_chain.h — receive-path substrate (priva
 class BlockPool;   // src/buffer/block_pool.h  — receive-path substrate (private)
 class BlockRef;    // src/buffer/block.h       — receive-path substrate (private)
 class BlockPoolFactory;
+class ByteStream;  // src/transport/byte_stream.h — I/O transport (plain socket or TLS)
 class Connection;
 class Listener;
 class Preconnection;
@@ -572,6 +573,11 @@ public:
 
 private:
     asio::ip::tcp::socket socket_;
+    // Data-path I/O goes through here: a PlainStream over socket_ by default, swapped
+    // for a TLS stream by the security provider at establishment. Declared after
+    // socket_ so it is destroyed first (it holds a reference to socket_). connect(),
+    // abort() and endpoint queries stay on socket_ directly.
+    std::unique_ptr<ByteStream> stream_;
     asio::ip::tcp::endpoint remote_endpoint_;
 
     // Cached endpoints to avoid system calls

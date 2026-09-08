@@ -5,6 +5,7 @@
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
 #include "buffer/heap_block_pool.h"
+#include "transport/plain_stream.h"
 #include <asio/use_awaitable.hpp>
 #include <asio/redirect_error.hpp>
 #include <asio/error.hpp>
@@ -16,6 +17,8 @@
 #include <cassert>
 #include <cstddef>
 #include <memory>
+#include <span>
+#include <vector>
 
 namespace taps {
 
@@ -26,6 +29,7 @@ namespace taps {
     TCPConnection::TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint,
                                  std::shared_ptr<BlockPoolFactory> pool_factory)
         : socket_(ctx),
+          stream_(std::make_unique<PlainStream>(socket_)),
           block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()),
           receive_chain_(std::make_unique<BlockChain>()),
           current_block_(std::make_unique<BlockRef>()){
@@ -36,6 +40,7 @@ namespace taps {
     TCPConnection::TCPConnection(asio::ip::tcp::socket socket,
                                  std::shared_ptr<BlockPoolFactory> pool_factory)
         : socket_(std::move(socket)),
+          stream_(std::make_unique<PlainStream>(socket_)),
           block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()),
           receive_chain_(std::make_unique<BlockChain>()),
           current_block_(std::make_unique<BlockRef>()) {
@@ -61,40 +66,42 @@ namespace taps {
                                               "Connection not established"));
         }
         
-        try {
-            if (framer_) {
-                // Gather-write: framing header (stack) + untouched payload, one
-                // async_write (writev under the hood). No payload copy.
-                std::array<std::byte, 64> hdr;
-                assert(framer_->max_header_size() <= hdr.size());
-                const std::size_t hn = framer_->write_header(message, hdr);
-                const auto body = message.as_bytes();
-                const std::array<asio::const_buffer, 2> iov{
-                    asio::buffer(hdr.data(), hn),
-                    asio::buffer(body.data(), body.size())};
-                co_await asio::async_write(socket_, iov, asio::use_awaitable);
-            } else if (const BlockChain* chain = message.block_chain()) {
-                // Chain-backed Message (e.g. echoing one straight back): gather-write
-                // its blocks, no copy.
-                std::vector<asio::const_buffer> iov;
-                iov.reserve(chain->block_count());
-                for (const BlockRef& b : *chain)
-                    iov.push_back(asio::buffer(b.data(), b.size()));
-                co_await asio::async_write(socket_, iov, asio::use_awaitable);
-            } else {
-                // vector / span variant: one contiguous buffer.
-                const auto body = message.as_bytes();
-                co_await asio::async_write(socket_,
-                    asio::buffer(body.data(), body.size()), asio::use_awaitable);
-            }
-            
-            co_return std::expected<void, TAPSError>{std::in_place};
-            
-        } catch (const std::system_error& e) {
-            state_ = ConnectionState::ERROR;
-            co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, 
-                                              e.code().message()));
+        // Build the buffer sequence, then hand it to the stream (PlainStream today,
+        // a TLS stream once security is applied). Gather semantics are preserved;
+        // payloads are never copied here.
+        std::array<std::byte, 64> hdr;
+        std::array<asio::const_buffer, 2> framed_iov;
+        std::vector<asio::const_buffer> chain_iov;
+        asio::const_buffer one_iov;
+        std::span<const asio::const_buffer> iov;
+
+        if (framer_) {
+            // Framing header (stack) + untouched payload.
+            assert(framer_->max_header_size() <= hdr.size());
+            const std::size_t hn = framer_->write_header(message, hdr);
+            const auto body = message.as_bytes();
+            framed_iov = {asio::buffer(hdr.data(), hn),
+                          asio::buffer(body.data(), body.size())};
+            iov = framed_iov;
+        } else if (const BlockChain* chain = message.block_chain()) {
+            // Chain-backed Message (e.g. echoing one straight back): its blocks.
+            chain_iov.reserve(chain->block_count());
+            for (const BlockRef& b : *chain)
+                chain_iov.push_back(asio::buffer(b.data(), b.size()));
+            iov = chain_iov;
+        } else {
+            // vector / span variant: one contiguous buffer.
+            const auto body = message.as_bytes();
+            one_iov = asio::buffer(body.data(), body.size());
+            iov = {&one_iov, 1};
         }
+
+        auto w = co_await stream_->write(iov);
+        if (!w) {
+            state_ = ConnectionState::ERROR;
+            co_return std::unexpected(w.error());
+        }
+        co_return std::expected<void, TAPSError>{std::in_place};
     }
     
     asio::awaitable<Result<Message>> TCPConnection::receive() {
@@ -123,17 +130,23 @@ namespace taps {
         }
         
         state_ = ConnectionState::CLOSING;
-        
+
+        // Graceful shutdown of the write direction (TCP FIN / TLS close_notify),
+        // then hard-close the socket.
+        auto sd = co_await stream_->shutdown();
+        if (!sd) {
+            state_ = ConnectionState::ERROR;
+            co_return std::unexpected(sd.error());
+        }
+
         try {
-            // Graceful shutdown
-            socket_.shutdown(asio::ip::tcp::socket::shutdown_both);
             socket_.close();
             state_ = ConnectionState::CLOSED;
             co_return std::expected<void, TAPSError>{std::in_place};
-            
+
         } catch (const std::system_error& e) {
             state_ = ConnectionState::ERROR;
-            co_return std::unexpected(TAPSError{ErrorType::INTERNAL_ERROR, 
+            co_return std::unexpected(TAPSError{ErrorType::INTERNAL_ERROR,
                                               e.code().message()});
         }
     }
@@ -211,17 +224,15 @@ namespace taps {
             }
         }
 
-        asio::error_code ec;
-        const std::size_t n = co_await socket_.async_read_some(
-            asio::buffer(current_block_->writable_data(), current_block_->capacity_after_begin()),
-            asio::redirect_error(asio::use_awaitable, ec));
-
-        if (ec == asio::error::eof) {
-            receive_eof_ = true;
-            co_return BlockRef{};   // no bytes this round; caller checks receive_eof_
+        auto r = co_await stream_->read_some(
+            asio::buffer(current_block_->writable_data(), current_block_->capacity_after_begin()));
+        if (!r) {
+            co_return std::unexpected(r.error());
         }
-        if (ec) {
-            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, ec.message()});
+        const std::size_t n = *r;
+        if (n == 0) {
+            receive_eof_ = true;
+            co_return BlockRef{};   // EOF: no bytes this round; caller checks receive_eof_
         }
 
         const std::size_t begin = current_block_->begin_offset();
