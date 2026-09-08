@@ -1,10 +1,30 @@
 #include "taps/taps_api.h"
+#include "security/security_provider.h"
+#ifdef TAPS_WITH_TLS
+#include "security/tls_provider.h"
+#endif
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 
+#include <exception>
 #include <string>
 
 namespace taps {
+
+// Out-of-line: security_provider_ is a unique_ptr to a forward-declared type, so
+// the constructor's and destructor's member cleanup is emitted here where
+// SecurityProvider is complete.
+Preconnection::Preconnection(asio::io_context& ctx, LocalEndpoint local, RemoteEndpoint remote,
+                             TransportProperties props, SecurityParameters security,
+                             std::shared_ptr<BlockPoolFactory> pool_factory)
+    : io_context_(ctx), local_endpoint_(std::move(local)),
+      transport_properties_(std::move(props)),
+      security_parameters_(std::move(security)),
+      pool_factory_(std::move(pool_factory)) {
+    remote_endpoints_.push_back(std::move(remote));
+}
+
+Preconnection::~Preconnection() = default;
 
 // ============================================================================
 // Preconnection Implementation
@@ -42,8 +62,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
                 co_return std::unexpected(connect_result.error());
             }
 
-            co_return co_await establish_connection(
-                std::unique_ptr<Connection>(std::move(tcp_conn)));
+            co_return co_await establish_connection(std::move(tcp_conn));
         } catch (const std::exception& e) {
             co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, e.what()));
         }
@@ -124,8 +143,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::race_connect
 
         auto connect_result = co_await conn->connect();
         if (connect_result) {
-            co_return co_await establish_connection(
-                std::unique_ptr<Connection>(std::move(conn)));
+            co_return co_await establish_connection(std::move(conn));
         }
 
         // Failed: record the error, release this attempt, pause before the next.
@@ -145,14 +163,46 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::race_connect
 
 
 asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::establish_connection(
-    std::unique_ptr<Connection> conn) {
-    // TLS/security establishment phase hooks in here: when security_parameters_
-    // requests it, construct the security provider and run its handshake over
-    // `conn` (wrap the transport, validate the peer certificate against the
-    // pinned trust anchor, check ALPN); on failure abort `conn` and return the
-    // error. See paper_taps/design/tls_experiment_notes.md (D3/D4). For now the
-    // connection is returned as-is.
+    std::unique_ptr<TCPConnection> conn) {
+
+    if (!security_parameters_.is_enabled()) {
+        co_return std::unique_ptr<Connection>(std::move(conn));
+    }
+
+#ifdef TAPS_WITH_TLS
+    if (!security_provider_) {
+        // co_await is not allowed inside a catch handler, so capture the failure
+        // and act on it after the try/catch.
+        std::string build_error;
+        try {
+            security_provider_ = std::make_unique<TlsProvider>(security_parameters_);
+        } catch (const std::exception& e) {
+            build_error = e.what();
+        }
+        if (!build_error.empty()) {
+            co_await conn->abort();
+            co_return std::unexpected(TAPSError{ErrorType::INVALID_CONFIGURATION, build_error});
+        }
+    }
+
+    // Identity to validate the peer against: the explicit server name if set,
+    // otherwise the remote endpoint's hostname.
+    std::string server_name = security_parameters_.server_name().empty()
+        ? remote_endpoints_.at(0).hostname()
+        : security_parameters_.server_name();
+
+    auto secured = co_await conn->apply_security(*security_provider_, std::move(server_name));
+    if (!secured) {
+        co_await conn->abort();
+        co_return std::unexpected(secured.error());
+    }
     co_return std::unique_ptr<Connection>(std::move(conn));
+#else
+    co_await conn->abort();
+    co_return std::unexpected(TAPSError{
+        ErrorType::INVALID_CONFIGURATION,
+        "SecurityParameters request TLS but this build has TAPS_WITH_TLS=OFF"});
+#endif
 }
 
 } // namespace taps

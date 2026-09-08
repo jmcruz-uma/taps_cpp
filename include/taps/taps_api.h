@@ -33,8 +33,10 @@ class BlockChain;  // src/buffer/block_chain.h — receive-path substrate (priva
 class BlockPool;   // src/buffer/block_pool.h  — receive-path substrate (private)
 class BlockRef;    // src/buffer/block.h       — receive-path substrate (private)
 class BlockPoolFactory;
-class ByteStream;  // src/transport/byte_stream.h — I/O transport (plain socket or TLS)
+class ByteStream;        // src/transport/byte_stream.h — I/O transport (plain socket or TLS)
+class SecurityProvider;  // src/security/security_provider.h — applies TLS at establishment
 class Connection;
+class TCPConnection;
 class Listener;
 class Preconnection;
 class TransportProperties;
@@ -462,14 +464,13 @@ protected:
 
 class Preconnection {
 public:
+    // Out-of-line (defined in Preconnection.cpp): security_provider_ is a unique_ptr
+    // to a forward-declared type, so the constructor's and destructor's cleanup code
+    // must be emitted where SecurityProvider is complete.
     Preconnection(asio::io_context& ctx, LocalEndpoint local, RemoteEndpoint remote,
-                 TransportProperties props, SecurityParameters security,
-                 std::shared_ptr<BlockPoolFactory> pool_factory = nullptr)
-        : io_context_(ctx), local_endpoint_(std::move(local)),
-          transport_properties_(std::move(props)),
-          security_parameters_(std::move(security)),
-          pool_factory_(std::move(pool_factory)) {
-            remote_endpoints_.push_back(std::move(remote)); }
+                  TransportProperties props, SecurityParameters security,
+                  std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+    ~Preconnection();
 
     asio::awaitable<Result<std::unique_ptr<Connection>>> initiate();
 
@@ -489,17 +490,19 @@ private:
     TransportProperties transport_properties_;
     SecurityParameters security_parameters_;
     std::shared_ptr<BlockPoolFactory> pool_factory_;
+    // Built once, lazily, on the first establish_connection() that needs it.
+    std::unique_ptr<SecurityProvider> security_provider_;
 
     asio::awaitable<Result<std::unique_ptr<Connection>>> initiate_with_single_endpoint();
     asio::awaitable<Result<std::unique_ptr<Connection>>> happy_eyeballs_racing();
     asio::awaitable<Result<std::unique_ptr<Connection>>> race_connections(const std::vector<asio::ip::tcp::endpoint>& endpoints);
 
-    // Post-connect establishment: finalises a freshly connected Connection before
-    // it is handed back to the caller. Today it only forwards ownership; it is the
-    // designated seam for the security/TLS establishment phase (SecurityParameters
-    // -> provider handshake over the winning transport). Both the single-endpoint
-    // path and the Happy Eyeballs winner funnel through here.
-    asio::awaitable<Result<std::unique_ptr<Connection>>> establish_connection(std::unique_ptr<Connection> conn);
+    // Post-connect establishment: applies the security provider to a freshly
+    // connected TCPConnection when SecurityParameters request it (handshake, peer
+    // validation, ALPN), then hands it back as a Connection. Without security it
+    // just forwards ownership. Both the single-endpoint path and the Happy Eyeballs
+    // winner funnel through here. Takes the concrete type so no down-cast is needed.
+    asio::awaitable<Result<std::unique_ptr<Connection>>> establish_connection(std::unique_ptr<TCPConnection> conn);
 };
 
 // A pluggable strategy for how each Connection obtains its receive-path
@@ -570,6 +573,13 @@ public:
     LocalEndpoint get_local_endpoint() const override;
 
     asio::awaitable<Result<void>> connect();
+
+    // Replace the plain I/O stream with a secured one produced by `provider`
+    // (TLS handshake over the already-connected socket, peer validated against
+    // `server_name`). Called by Preconnection during establishment; a no-op path
+    // for the connection is never asked to do this when no security is requested.
+    asio::awaitable<Result<void>> apply_security(SecurityProvider& provider,
+                                                std::string server_name);
 
 private:
     asio::ip::tcp::socket socket_;

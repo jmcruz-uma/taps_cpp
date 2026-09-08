@@ -6,6 +6,7 @@
 #include "buffer/block_pool.h"
 #include "buffer/heap_block_pool.h"
 #include "transport/plain_stream.h"
+#include "security/security_provider.h"
 #include <asio/use_awaitable.hpp>
 #include <asio/redirect_error.hpp>
 #include <asio/error.hpp>
@@ -181,6 +182,17 @@ namespace taps {
     }
       
     
+    asio::awaitable<Result<void>> TCPConnection::apply_security(
+        SecurityProvider& provider, std::string server_name) {
+        auto secured = co_await provider.secure(socket_, std::move(server_name));
+        if (!secured) {
+            state_ = ConnectionState::ERROR;
+            co_return std::unexpected(secured.error());
+        }
+        stream_ = std::move(*secured);   // the plain PlainStream is dropped here
+        co_return std::expected<void, TAPSError>{std::in_place};
+    }
+
     // Method to establish connection (called by Preconnection)
     asio::awaitable<Result<void>> TCPConnection::connect() {
         if (state_ != ConnectionState::ESTABLISHING) {

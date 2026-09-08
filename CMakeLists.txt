@@ -41,6 +41,11 @@ message(STATUS "Using ASIO from: ${ASIO_INCLUDE_DIR}")
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${ASIO_INCLUDE_DIR})
 
+# TLS support pulls in OpenSSL. Opt-out (-DTAPS_WITH_TLS=OFF) for consumers that
+# don't need it: the library then builds with no OpenSSL dependency and requesting
+# TLS through SecurityParameters fails at connection establishment.
+option(TAPS_WITH_TLS "Build TLS support (requires OpenSSL)" ON)
+
 # Agregar subdirectorios
 add_subdirectory(src)        # Biblioteca TAPS
 
