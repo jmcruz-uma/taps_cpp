@@ -8,19 +8,35 @@
 
 namespace taps {
 
-asio::awaitable<Result<void>> TlsStream::handshake(std::string server_name) {
-    // SNI: tell the server which name we expect, so it can pick the right cert.
+asio::awaitable<Result<void>> TlsStream::handshake_client(std::string server_name) {
     if (!server_name.empty()) {
+        // SNI: tell the server which name we expect, so it can pick the right cert.
         if (::SSL_set_tlsext_host_name(ssl_.native_handle(), server_name.c_str()) != 1) {
             co_return std::unexpected(
                 TAPSError{ErrorType::INTERNAL_ERROR, "failed to set TLS SNI host name"});
         }
         // Validate the presented certificate against the same name.
-        ssl_.set_verify_callback(asio::ssl::host_name_verification(server_name));
+        asio::error_code vc_ec;
+        ssl_.set_verify_callback(asio::ssl::host_name_verification(server_name), vc_ec);
+        if (vc_ec) {
+            co_return std::unexpected(
+                TAPSError{ErrorType::INTERNAL_ERROR, "set_verify_callback: " + vc_ec.message()});
+        }
     }
 
     asio::error_code ec;
     co_await ssl_.async_handshake(asio::ssl::stream_base::client,
+                                 asio::redirect_error(asio::use_awaitable, ec));
+    if (ec) {
+        co_return std::unexpected(
+            TAPSError{ErrorType::CONNECTION_FAILED, "TLS handshake failed: " + ec.message()});
+    }
+    co_return std::expected<void, TAPSError>{std::in_place};
+}
+
+asio::awaitable<Result<void>> TlsStream::handshake_server() {
+    asio::error_code ec;
+    co_await ssl_.async_handshake(asio::ssl::stream_base::server,
                                  asio::redirect_error(asio::use_awaitable, ec));
     if (ec) {
         co_return std::unexpected(

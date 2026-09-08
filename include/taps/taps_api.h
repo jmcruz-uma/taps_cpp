@@ -195,6 +195,16 @@ public:
         supported_groups_ = std::move(groups);
     }
 
+    // RFC 9622 Section 6.3.2 (serverCertificate). Paths to the server's PEM
+    // certificate chain and private key. Required on the listener side when TLS
+    // is requested; unused on the client side.
+    void set_certificate_chain_file(std::string path) {
+        certificate_chain_file_ = std::move(path);
+    }
+    void set_private_key_file(std::string path) {
+        private_key_file_ = std::move(path);
+    }
+
     void set_pre_shared_key(std::string_view key) {
         pre_shared_keys_.emplace_back(key);
     }
@@ -209,6 +219,8 @@ public:
     const std::vector<std::string>& alpn_protocols() const noexcept { return alpn_; }
     const std::vector<std::string>& ciphersuites() const noexcept { return ciphersuites_; }
     const std::vector<std::string>& supported_groups() const noexcept { return supported_groups_; }
+    const std::string& certificate_chain_file() const noexcept { return certificate_chain_file_; }
+    const std::string& private_key_file() const noexcept { return private_key_file_; }
 
 private:
     std::vector<SecurityProtocol> allowed_protocols_;
@@ -216,6 +228,8 @@ private:
     std::vector<std::string> local_identity_;
     std::vector<std::string> trust_ca_;
     std::string server_name_;
+    std::string certificate_chain_file_;
+    std::string private_key_file_;
     std::vector<std::string> alpn_;
     std::vector<std::string> ciphersuites_;
     std::vector<std::string> supported_groups_;
@@ -677,6 +691,7 @@ public:
                         TransportProperties properties = {},
                         SecurityParameters security = {},
                         std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+    ~TCPListener();  // out-of-line: security_provider_ is a unique_ptr to a private type
 
     asio::awaitable<Result<void>> listen() override;
     asio::awaitable<Result<std::unique_ptr<Connection>>> accept() override;
@@ -691,6 +706,9 @@ private:
     asio::ip::tcp::acceptor acceptor_;
     // Forwarded to each TCPConnection accept() spawns; see BlockPoolFactory.
     std::shared_ptr<BlockPoolFactory> pool_factory_;
+    // Server-side TLS provider, built once (lazily) on the first accept() that
+    // needs it when security_parameters_ request TLS.
+    std::unique_ptr<SecurityProvider> security_provider_;
 };
 
 class UDPListener : public Listener {

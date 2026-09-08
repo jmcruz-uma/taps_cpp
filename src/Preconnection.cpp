@@ -171,18 +171,12 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::establish_co
 
 #ifdef TAPS_WITH_TLS
     if (!security_provider_) {
-        // co_await is not allowed inside a catch handler, so capture the failure
-        // and act on it after the try/catch.
-        std::string build_error;
-        try {
-            security_provider_ = std::make_unique<TlsProvider>(security_parameters_);
-        } catch (const std::exception& e) {
-            build_error = e.what();
-        }
-        if (!build_error.empty()) {
+        auto provider = TlsProvider::create(security_parameters_, TlsProvider::Role::Client);
+        if (!provider) {
             co_await conn->abort();
-            co_return std::unexpected(TAPSError{ErrorType::INVALID_CONFIGURATION, build_error});
+            co_return std::unexpected(provider.error());
         }
+        security_provider_ = std::move(*provider);
     }
 
     // Identity to validate the peer against: the explicit server name if set,

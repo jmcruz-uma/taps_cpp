@@ -32,6 +32,8 @@ static void test_defaults() {
     CHECK(sp.alpn_protocols().empty());
     CHECK(sp.ciphersuites().empty());
     CHECK(sp.supported_groups().empty());
+    CHECK(sp.certificate_chain_file().empty());
+    CHECK(sp.private_key_file().empty());
 }
 
 static void test_enable_signal() {
@@ -78,6 +80,11 @@ static void test_setters_roundtrip() {
     sp.set_supported_groups({"X25519"});
     CHECK(sp.supported_groups().size() == 1);
     CHECK(sp.supported_groups().front() == "X25519");
+
+    sp.set_certificate_chain_file("srv.crt");
+    sp.set_private_key_file("srv.key");
+    CHECK(sp.certificate_chain_file() == "srv.crt");
+    CHECK(sp.private_key_file() == "srv.key");
 }
 
 static void test_copyable() {

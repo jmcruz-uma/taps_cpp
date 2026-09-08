@@ -1,5 +1,9 @@
 
 #include "taps/taps_api.h"
+#include "security/security_provider.h"
+#ifdef TAPS_WITH_TLS
+#include "security/tls_provider.h"
+#endif
 #include <asio/use_awaitable.hpp>
 #include <asio/buffer.hpp>
 #include <asio/read.hpp>
@@ -7,6 +11,9 @@
 #include <algorithm>
 
 namespace taps {
+
+// Out-of-line: security_provider_ is a unique_ptr to a forward-declared type.
+TCPListener::~TCPListener() = default;
 
 
 // ============================================================================
@@ -77,12 +84,36 @@ asio::awaitable<Result<void>> TCPListener::listen() {
         
         try {
             auto socket = co_await acceptor_.async_accept(asio::use_awaitable);
-            
+
             // Create connection from accepted socket
             auto connection = std::make_unique<TCPConnection>(std::move(socket), pool_factory_);
-            
+
+            if (security_parameters_.is_enabled()) {
+#ifdef TAPS_WITH_TLS
+                if (!security_provider_) {
+                    auto provider = TlsProvider::create(security_parameters_,
+                                                        TlsProvider::Role::Server);
+                    if (!provider) {
+                        co_await connection->abort();
+                        co_return std::unexpected(provider.error());
+                    }
+                    security_provider_ = std::move(*provider);
+                }
+                auto secured = co_await connection->apply_security(*security_provider_, "");
+                if (!secured) {
+                    co_await connection->abort();
+                    co_return std::unexpected(secured.error());
+                }
+#else
+                co_await connection->abort();
+                co_return std::unexpected(TAPSError{
+                    ErrorType::INVALID_CONFIGURATION,
+                    "SecurityParameters request TLS but this build has TAPS_WITH_TLS=OFF"});
+#endif
+            }
+
             co_return std::unique_ptr<Connection>(std::move(connection));
-            
+
         } catch (const std::system_error& e) {
             co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, 
                                               e.code().message()});

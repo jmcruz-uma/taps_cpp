@@ -18,9 +18,11 @@ public:
     TlsStream(asio::ip::tcp::socket& socket, asio::ssl::context& context)
         : ssl_(socket, context) {}
 
-    // Client-side TLS handshake: sets SNI and host-name verification to
-    // `server_name`, then negotiates. Called once, before any read/write.
-    asio::awaitable<Result<void>> handshake(std::string server_name);
+    // TLS handshake, called once before any read/write.
+    //  - client: sets SNI and host-name verification to `server_name`, negotiates.
+    //  - server: negotiates using the context's certificate; no name to verify.
+    asio::awaitable<Result<void>> handshake_client(std::string server_name);
+    asio::awaitable<Result<void>> handshake_server();
 
     // The ALPN protocol the handshake selected, or "" if none was negotiated.
     // Not const: asio::ssl::stream::native_handle() is non-const.
