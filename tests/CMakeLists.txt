@@ -3,9 +3,10 @@
 add_executable(buffer_smoke buffer_smoke.cpp)
 add_executable(message_test message_test.cpp)
 add_executable(framer_test  framer_test.cpp)
+add_executable(security_parameters_test security_parameters_test.cpp)
 
 # The block substrate lives under src/ as private headers.
-foreach(t buffer_smoke message_test framer_test)
+foreach(t buffer_smoke message_test framer_test security_parameters_test)
     target_include_directories(${t} PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(${t} PRIVATE taps_static)
     if(UNIX AND NOT APPLE)

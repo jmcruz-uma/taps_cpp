@@ -140,21 +140,82 @@ enum class TLSVersion {
     TLS_1_3
 };
 
+// RFC 9622 Section 6.3.1 allowedSecurityProtocols. Only TLS is supported today;
+// the enum leaves room for DTLS / others without an API break.
+enum class SecurityProtocol {
+    TLS
+};
+
 class SecurityParameters {
 public:
+    // Convenience: require TLS (the only protocol currently supported). Equivalent
+    // to set_allowed_protocols({SecurityProtocol::TLS}). With no protocol set, a
+    // Connection is established without security.
+    void require_tls() {
+        allowed_protocols_ = { SecurityProtocol::TLS };
+    }
+
+    // RFC 9622 Section 6.3.1. Empty (the default) means no security is requested.
+    void set_allowed_protocols(std::vector<SecurityProtocol> protocols) {
+        allowed_protocols_ = std::move(protocols);
+    }
+
     void set_tls_version_range(TLSVersion min_version, TLSVersion max_version) {
         min_tls_version_ = min_version;
         max_tls_version_ = max_version;
     }
-    
+
+    // RFC 9622 Section 6.3.3. Path to a PEM file holding a trust anchor the peer
+    // certificate is validated against. Repeatable.
+    void add_trust_anchor(std::string ca_file_path) {
+        trust_ca_.push_back(std::move(ca_file_path));
+    }
+
+    // Identity the peer certificate is validated against, also sent as SNI. When
+    // unset, the remote endpoint hostname is used.
+    void set_server_name(std::string name) {
+        server_name_ = std::move(name);
+    }
+
+    // RFC 9622 Section 6.3.4. ALPN protocol identifiers, in order of preference.
+    // Repeatable.
+    void add_alpn(std::string protocol_id) {
+        alpn_.push_back(std::move(protocol_id));
+    }
+
+    // RFC 9622 Section 6.3.5. When non-empty, restricts the TLS 1.3 cipher suites
+    // / named groups to exactly this list (used to pin one of each for measurement).
+    void set_ciphersuites(std::vector<std::string> suites) {
+        ciphersuites_ = std::move(suites);
+    }
+    void set_supported_groups(std::vector<std::string> groups) {
+        supported_groups_ = std::move(groups);
+    }
+
     void set_pre_shared_key(std::string_view key) {
         pre_shared_keys_.emplace_back(key);
     }
 
+    // Accessors for the security provider (which lives under src/).
+    bool is_enabled() const noexcept { return !allowed_protocols_.empty(); }
+    const std::vector<SecurityProtocol>& allowed_protocols() const noexcept { return allowed_protocols_; }
+    TLSVersion min_tls_version() const noexcept { return min_tls_version_; }
+    TLSVersion max_tls_version() const noexcept { return max_tls_version_; }
+    const std::vector<std::string>& trust_anchors() const noexcept { return trust_ca_; }
+    const std::string& server_name() const noexcept { return server_name_; }
+    const std::vector<std::string>& alpn_protocols() const noexcept { return alpn_; }
+    const std::vector<std::string>& ciphersuites() const noexcept { return ciphersuites_; }
+    const std::vector<std::string>& supported_groups() const noexcept { return supported_groups_; }
+
 private:
+    std::vector<SecurityProtocol> allowed_protocols_;
     std::vector<std::string> pre_shared_keys_;
     std::vector<std::string> local_identity_;
     std::vector<std::string> trust_ca_;
+    std::string server_name_;
+    std::vector<std::string> alpn_;
+    std::vector<std::string> ciphersuites_;
+    std::vector<std::string> supported_groups_;
     TLSVersion min_tls_version_ = TLSVersion::TLS_1_2;
     TLSVersion max_tls_version_ = TLSVersion::TLS_1_3;
 };
