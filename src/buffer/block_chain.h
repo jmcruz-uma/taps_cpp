@@ -31,6 +31,16 @@ public:
     std::size_t size()        const noexcept { return size_; }            // live bytes
     std::size_t block_count() const noexcept { return blocks_.size(); }
 
+    // The pool the chain's blocks were minted by, or nullptr for an empty chain.
+    // Every block in one chain is assumed to share the same pool (true by
+    // construction: a chain is built from one Connection's one pool's acquire()
+    // calls). Used by Message::ensure_gathered() to route the final gather
+    // allocation through the same strategy's hook (BlockPool::allocate_contiguous)
+    // instead of an unconditional global `new`.
+    BlockPool* pool() const noexcept {
+        return blocks_.empty() ? nullptr : blocks_.front().block()->pool();
+    }
+
     // Iteration over the constituent BlockRefs, front to back.
     auto begin() const noexcept { return blocks_.begin(); }
     auto end()   const noexcept { return blocks_.end(); }

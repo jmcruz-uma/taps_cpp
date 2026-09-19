@@ -38,6 +38,12 @@ public:
     const std::byte* data() const noexcept { return storage_.get(); }
     std::size_t      capacity() const noexcept { return capacity_; }
 
+    // The pool this block was minted by (nullptr for a detached block). Lets a
+    // BlockChain built from this block's pool reach that pool's allocation hook
+    // for a same-strategy contiguous gather buffer (BlockPool::allocate_contiguous)
+    // instead of an unconditional global `new`.
+    BlockPool* pool() const noexcept { return pool_; }
+
     void add_ref() noexcept {
         refcount_.fetch_add(1, std::memory_order_relaxed);
     }

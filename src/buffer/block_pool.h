@@ -3,6 +3,7 @@
 #include "buffer/block.h"
 
 #include <cstddef>
+#include <memory>
 
 namespace taps {
 
@@ -34,6 +35,22 @@ public:
     // Introspection (tests / metrics).
     virtual std::size_t free_blocks() const noexcept = 0;
     virtual std::size_t live_blocks() const noexcept = 0;
+
+    // The strategy's answer for a single contiguous buffer of `n` bytes, used only
+    // by Message::ensure_gathered() when a chain spans more than one block and the
+    // caller asked for it as_bytes(). This is a DIFFERENT allocation shape than
+    // acquire()'s fixed block_size() blocks — it exists so a workload-aware
+    // application can redirect it too (a static arena, a std::pmr resource, ...),
+    // not because every BlockPool strategy needs its own answer: the default here
+    // is exactly what every caller got before this hook existed (a plain heap
+    // allocation), so a strategy that doesn't care about this allocation shape
+    // needs no override at all. Not pure virtual on purpose — unlike acquire() /
+    // block_size() / at_capacity(), a concrete strategy has a perfectly good
+    // default and forcing every future strategy to restate it would be the kind of
+    // boilerplate this interface otherwise avoids.
+    virtual std::shared_ptr<std::byte[]> allocate_contiguous(std::size_t n) const {
+        return std::shared_ptr<std::byte[]>(new std::byte[n]);
+    }
 
 private:
     friend class DataBlock;

@@ -1,6 +1,7 @@
 #include "taps/taps_api.h"
 
 #include "buffer/block_chain.h"
+#include "buffer/block_pool.h"
 
 #include <cstring>
 #include <memory>
@@ -22,9 +23,16 @@ std::span<const std::byte> Message::ensure_gathered() const {
 
     if (!gathered_valid_) {
         const std::size_t n = chain_ ? chain_->size() : 0;
-        // new[] (not make_shared) leaves the bytes uninitialised — we overwrite
-        // all of them immediately; no wasted zero-fill.
-        gathered_ = std::shared_ptr<std::byte[]>(new std::byte[n]);
+        // Routed through the owning BlockPool's allocate_contiguous() hook (default
+        // implementation: the same new[] this used to call unconditionally) so a
+        // workload-aware application can redirect this allocation too -- e.g. to a
+        // static arena for an embedded target -- via a custom BlockPool strategy,
+        // the same way acquire()/warm_up() already let it control the per-block
+        // allocations. chain_->pool() is null only for an empty chain (n == 0),
+        // where the fallback below never actually allocates anything.
+        BlockPool* pool = chain_ ? chain_->pool() : nullptr;
+        gathered_ = pool ? pool->allocate_contiguous(n)
+                          : std::shared_ptr<std::byte[]>(new std::byte[n]);
         gathered_size_ = n;
         if (chain_ && n)
             chain_->copy_to(std::span<std::byte>(gathered_.get(), n));
