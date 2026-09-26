@@ -49,6 +49,7 @@ class LocalEndpoint;
 class RemoteEndpoint;
 class Mailbox;
 class UDPDemux;
+class SecureAcceptor;
 
 // ============================================================================
 // Error Handling
@@ -837,7 +838,8 @@ public:
                         TransportProperties properties = {},
                         SecurityParameters security = {},
                         MessageMemoryConfig memory = {});
-    ~TCPListener();  // out-of-line: security_provider_ is a unique_ptr to a private type
+    // Stops accepting; Connections already accepted are unaffected.
+    ~TCPListener();
 
     asio::awaitable<Result<void>> listen() override;
     asio::awaitable<Result<std::unique_ptr<Connection>>> accept() override;
@@ -852,9 +854,8 @@ private:
     asio::ip::tcp::acceptor acceptor_;
     // Given to each TCPConnection accept() creates.
     MessageMemoryConfig memory_;
-    // Server-side TLS provider, built once (lazily) on the first accept() that
-    // needs it when security_parameters_ request TLS.
-    std::unique_ptr<SecurityProvider> security_provider_;
+    // With security: accepts and secures connections in parallel (owns the acceptor).
+    std::shared_ptr<SecureAcceptor> secure_;
 };
 
 class UDPListener : public Listener {

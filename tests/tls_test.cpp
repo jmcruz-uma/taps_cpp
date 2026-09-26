@@ -32,6 +32,14 @@ static int g_failures = 0;
         else { std::printf("FAIL  %s  (%s:%d)\n", name, __FILE__, __LINE__); ++g_failures; } \
     } while (0)
 
+// Completion handler for spawned coroutines: an escaping exception is a failure.
+static void fail_on_exception(std::exception_ptr e) {
+    if (!e) return;
+    try { std::rethrow_exception(e); }
+    catch (const std::exception& x) { std::printf("FAIL  coroutine threw: %s\n", x.what()); }
+    ++g_failures;
+}
+
 static std::string path(const char* f) { return std::string(TLS_TEST_CERT_DIR) + "/" + f; }
 
 static TransportProperties tcp_props() {
@@ -272,6 +280,89 @@ static asio::awaitable<void> pending_receive_client(asio::io_context& ctx, std::
           "TLS close with a pending receive: close() completes, CLOSED");
 }
 
+// Handshakes of concurrent clients run in parallel: a client that connects and
+// never starts its handshake does not hold back the next one.
+static asio::awaitable<void> parallel_handshake_server(asio::io_context& ctx, std::uint16_t port,
+                                                       bool& accepted_second) {
+    TransportServices ts(ctx);
+    auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, tcp_props(), server_params());
+    if (!lr) { ++g_failures; co_return; }
+    auto ar = co_await (*lr)->accept();
+    accepted_second = static_cast<bool>(ar);
+    if (ar) {
+        auto rr = co_await (*ar)->receive();
+        if (rr) co_await (*ar)->send(*rr);
+        co_await (*ar)->close();
+    }
+}
+
+static asio::awaitable<void> parallel_handshake_client(asio::io_context& ctx, std::uint16_t port,
+                                                       const bool& accepted_second) {
+    asio::ip::tcp::socket stalled(ctx);                  // connects, never handshakes
+    co_await stalled.async_connect({asio::ip::make_address("127.0.0.1"), port}, asio::use_awaitable);
+    asio::steady_timer t(ctx, std::chrono::milliseconds(50));
+    co_await t.async_wait(asio::use_awaitable);
+
+    TransportServices ts(ctx);
+    auto pc = ts.preconnect(LocalEndpoint{}, RemoteEndpoint{"127.0.0.1", port},
+                            tcp_props(), client_params(path("ca.crt")));
+    auto cr = co_await pc.initiate();
+    bool echoed = false;
+    if (cr) {
+        const std::string hello = "hello";
+        co_await (*cr)->send(make_message_view(hello));
+        auto rr = co_await (*cr)->receive();
+        echoed = rr && rr->size() == hello.size();
+        co_await (*cr)->close();
+    }
+    CHECK(cr && echoed && accepted_second,
+          "TLS listener: a stalled handshake does not hold back the next client");
+    stalled.close();
+}
+
+// A TLS configuration the Listener cannot fulfil fails listen(), not a later accept().
+static asio::awaitable<void> bad_config_listen(asio::io_context& ctx, std::uint16_t port) {
+    TransportServices ts(ctx);
+    SecurityParameters sp = server_params();
+    sp.set_certificate_chain_file(path("does-not-exist.crt"));
+    auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, tcp_props(), sp);
+    CHECK(!lr && lr.error().event() == ErrorEvent::ESTABLISHMENT_ERROR &&
+              lr.error().reason() == ErrorReason::INVALID_CONFIGURATION,
+          "TLS listener: a bad certificate fails listen() with ESTABLISHMENT_ERROR / INVALID_CONFIGURATION");
+}
+
+// stop() makes a pending accept() fail; the Listener can then be destroyed with a
+// handshake still in flight.
+static asio::awaitable<void> stop_with_pending_accept(asio::io_context& ctx, std::uint16_t port) {
+    TransportServices ts(ctx);
+    auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, tcp_props(), server_params());
+    if (!lr) { ++g_failures; co_return; }
+    auto listener = std::move(*lr);
+    asio::ip::tcp::socket stalled(ctx);                  // a handshake that will be in flight
+    co_await stalled.async_connect({asio::ip::make_address("127.0.0.1"), port}, asio::use_awaitable);
+
+    Listener* raw = listener.get();
+    Result<std::unique_ptr<Connection>> pending =
+        std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, "not run"});
+    bool pending_done = false;
+    asio::co_spawn(ctx, [raw, &pending, &pending_done]() -> asio::awaitable<void> {
+        pending = co_await raw->accept();
+        pending_done = true;
+    }, fail_on_exception);
+    asio::steady_timer t(ctx, std::chrono::milliseconds(50));
+    co_await t.async_wait(asio::use_awaitable);
+    co_await listener->stop();
+    t.expires_after(std::chrono::milliseconds(50));
+    co_await t.async_wait(asio::use_awaitable);
+    CHECK(pending_done && !pending && pending.error().event() == ErrorEvent::ESTABLISHMENT_ERROR &&
+              pending.error().reason() == ErrorReason::INVALID_STATE,
+          "TLS listener: stop() makes a pending accept() fail with ESTABLISHMENT_ERROR / INVALID_STATE");
+    listener.reset();                                    // handshake still in flight
+    stalled.close();                                     // it fails now, after the Listener is gone
+    t.expires_after(std::chrono::milliseconds(100));
+    co_await t.async_wait(asio::use_awaitable);
+}
+
 // Client that pins the wrong anchor (the leaf itself) must fail the handshake.
 static asio::awaitable<void> bad_anchor_client(asio::io_context& ctx, std::uint16_t port) {
     TransportServices ts(ctx);
@@ -283,13 +374,6 @@ static asio::awaitable<void> bad_anchor_client(asio::io_context& ctx, std::uint1
           "wrong trust anchor is rejected: ESTABLISHMENT_ERROR / ESTABLISHMENT_FAILED");
 }
 
-// Completion handler for spawned coroutines: an escaping exception is a failure.
-static void fail_on_exception(std::exception_ptr e) {
-    if (!e) return;
-    try { std::rethrow_exception(e); }
-    catch (const std::exception& x) { std::printf("FAIL  coroutine threw: %s\n", x.what()); }
-    ++g_failures;
-}
 
 // Set by each scenario's client when it reaches its end.
 static bool g_client_done = false;
@@ -379,6 +463,39 @@ int main() {
             asio::steady_timer t(c, std::chrono::milliseconds(150));
             co_await t.async_wait(asio::use_awaitable);
             co_await pending_receive_client(c, 19976);
+            g_client_done = true;
+            c.stop();
+        }, fail_on_exception);
+    });
+
+    {
+        bool accepted_second = false;
+        scenario([&accepted_second](asio::io_context& c) {
+            co_spawn(c, parallel_handshake_server(c, 19977, accepted_second), fail_on_exception);
+            co_spawn(c, [&c]() -> asio::awaitable<void> {     // serialised handshakes would hang
+                asio::steady_timer watchdog(c, std::chrono::seconds(5));
+                co_await watchdog.async_wait(asio::use_awaitable);
+                c.stop();
+            }, fail_on_exception);
+            co_spawn(c, [&c, &accepted_second]() -> asio::awaitable<void> {
+                asio::steady_timer t(c, std::chrono::milliseconds(150));
+                co_await t.async_wait(asio::use_awaitable);
+                co_await parallel_handshake_client(c, 19977, accepted_second);
+                g_client_done = true;
+                c.stop();
+            }, fail_on_exception);
+        });
+    }
+    scenario([](asio::io_context& c) {
+        co_spawn(c, [&c]() -> asio::awaitable<void> {
+            co_await bad_config_listen(c, 19978);
+            g_client_done = true;
+            c.stop();
+        }, fail_on_exception);
+    });
+    scenario([](asio::io_context& c) {
+        co_spawn(c, [&c]() -> asio::awaitable<void> {
+            co_await stop_with_pending_accept(c, 19979);
             g_client_done = true;
             c.stop();
         }, fail_on_exception);
