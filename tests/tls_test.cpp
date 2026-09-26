@@ -139,6 +139,41 @@ static asio::awaitable<void> bulk_client(asio::io_context& ctx, std::uint16_t po
     co_await conn->close();
 }
 
+// Server that sends and then drops the connection without close(): the socket closes
+// without a TLS close_notify.
+static constexpr std::size_t DROP_BYTES = 64u * 1024;
+
+static asio::awaitable<void> drop_server(asio::io_context& ctx, std::uint16_t port) {
+    TransportServices ts(ctx);
+    auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, tcp_props(), server_params());
+    if (!lr) { ++g_failures; co_return; }
+    auto ar = co_await (*lr)->accept();
+    if (!ar) { ++g_failures; co_return; }
+    auto conn = std::move(*ar);
+    std::vector<std::uint8_t> buf(DROP_BYTES, 0x5a);
+    co_await conn->send(make_message_view(buf));
+}
+
+static asio::awaitable<void> truncation_client(asio::io_context& ctx, std::uint16_t port) {
+    TransportServices ts(ctx);
+    auto pc = ts.preconnect(LocalEndpoint{}, RemoteEndpoint{"127.0.0.1", port},
+                            tcp_props(), client_params(path("ca.crt")));
+    auto cr = co_await pc.initiate();
+    if (!cr) { std::printf("FAIL  truncation: initiate: %s\n", cr.error().message().c_str()); ++g_failures; co_return; }
+    auto& conn = *cr;
+    std::size_t total = 0;
+    bool clean_end = false;
+    for (;;) {
+        auto rr = co_await conn->receive();
+        if (!rr) break;
+        auto m = std::move(*rr);
+        if (m.size() == 0) { clean_end = m.is_end_of_message(); break; }
+        total += m.size();
+    }
+    CHECK(total == DROP_BYTES && clean_end,
+          "peer closing without close_notify ends the stream like a clean close");
+}
+
 // Client that pins the wrong anchor (the leaf itself) must fail the handshake.
 static asio::awaitable<void> bad_anchor_client(asio::io_context& ctx, std::uint16_t port) {
     TransportServices ts(ctx);
@@ -190,6 +225,15 @@ int main() {
             asio::steady_timer t(c, std::chrono::milliseconds(150));
             co_await t.async_wait(asio::use_awaitable);
             co_await bad_anchor_client(c, 19973);
+            c.stop();
+        }, asio::detached);
+    });
+    scenario([](asio::io_context& c) {
+        co_spawn(c, drop_server(c, 19974), asio::detached);
+        co_spawn(c, [&c]() -> asio::awaitable<void> {
+            asio::steady_timer t(c, std::chrono::milliseconds(150));
+            co_await t.async_wait(asio::use_awaitable);
+            co_await truncation_client(c, 19974);
             c.stop();
         }, asio::detached);
     });
