@@ -21,6 +21,8 @@
 #include <chrono>
 #include <cstddef>
 #include <span>
+#include <system_error>
+#include <tuple>
 #include <expected>
 #include <optional>
 #include <unordered_map>
@@ -740,27 +742,31 @@ private:
     bool message_open_ = false;
     // abort() was called: cancelled operations report LOCAL_ABORT.
     bool aborted_ = false;
-    // The block read_one_chunk() is currently filling; may be invalid (no block
-    // checked out). Kept across calls so a small read doesn't strand the rest of
-    // a block's capacity — see read_one_chunk().
+    // The block the next read fills; may be invalid (no block checked out). Kept
+    // across reads so a small read doesn't strand the rest of a block's capacity.
     std::unique_ptr<BlockRef> current_block_;
 
-    asio::awaitable<Result<Message>> receive_with_framing();
-    asio::awaitable<Result<Message>> receive_without_framing();
+    // The two receive modes, one coroutine each: framed records (RFC 9623
+    // Section 6) and the unframed byte stream (RFC 9622 Section 9.3.2.2).
+    asio::awaitable<Result<Message>> receive_framed();
+    asio::awaitable<Result<Message>> receive_unframed();
+
+    // Why receive() cannot proceed now, if it cannot.
+    std::optional<TAPSError> receive_refused() const;
 
     // Classifies a receive-path failure and applies its effect on state_.
     TAPSError receive_failure(TAPSError error);
 
-    // Reads the next chunk of the byte-stream into a pooled block, reusing
-    // current_block_'s leftover capacity across calls instead of checking out a
-    // fresh block every time (a fresh block is preferred once the leftover space
-    // drops below a quarter of the pool's block size, so a later read doesn't get
-    // starved into an extra syscall). Each call's bytes are delivered as their own
-    // refcounted window; several such windows may share one DataBlock. Returns an
-    // empty/invalid BlockRef on a graceful close (receive_eof_ is set as a side
-    // effect) — used identically by receive_with_framing() and
-    // receive_without_framing(), so the block-reuse policy lives in one place.
-    asio::awaitable<Result<BlockRef>> read_one_chunk();
+    // One read of the byte stream into current_block_, in two steps around the
+    // co_await of the stream's read operation, so the read adds no coroutine frame.
+    // start_read() picks the block: current_block_'s leftover capacity, or a fresh
+    // block once less than a quarter of the block size is left (so a later read is
+    // not starved into an extra syscall); it fails at the pool's live-block cap.
+    // finish_read() turns the outcome into a refcounted window of the block (several
+    // windows may share one block), an invalid BlockRef when the peer ended its side
+    // (receive_eof_ set), or an error.
+    Result<asio::awaitable<std::tuple<std::error_code, std::size_t>>> start_read();
+    Result<BlockRef> finish_read(const std::error_code& ec, std::size_t n);
 };
 
 

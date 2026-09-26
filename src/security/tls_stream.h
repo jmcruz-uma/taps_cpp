@@ -14,10 +14,10 @@ namespace taps {
 // socket is held by reference and stays owned by the TCPConnection (connect() /
 // abort() / endpoint queries keep using it directly). The asio::ssl::context is
 // owned by the TlsProvider that created this stream and must outlive it.
-class TlsStream : public ByteStream {
+class TlsStream final : public AsioStream<asio::ssl::stream<asio::ip::tcp::socket&>> {
 public:
     TlsStream(asio::ip::tcp::socket& socket, asio::ssl::context& context)
-        : ssl_(socket, context) {}
+        : AsioStream<asio::ssl::stream<asio::ip::tcp::socket&>>(socket, context) {}
 
     // TLS handshake, called once before any read/write.
     //  - client: sets SNI and host-name verification to `server_name`, negotiates.
@@ -30,17 +30,11 @@ public:
     std::string negotiated_alpn();
 
     // The negotiated TLS version / cipher / group / ALPN plus the linked OpenSSL
-    // version, for the harness comparability check. Non-const for the same reason
-    // as negotiated_alpn(). Always engaged once handshake_*() has returned.
+    // version. Non-const for the same reason as negotiated_alpn(). Always engaged
+    // once handshake_*() has returned.
     std::optional<SecurityInfo> security_info() override;
 
-    asio::awaitable<Result<std::size_t>> read_some(asio::mutable_buffer buffer) override;
-    asio::awaitable<Result<std::size_t>> write(
-        std::span<const asio::const_buffer> buffers) override;
     asio::awaitable<Result<void>> shutdown() override;
-
-private:
-    asio::ssl::stream<asio::ip::tcp::socket&> ssl_;
 };
 
 }  // namespace taps

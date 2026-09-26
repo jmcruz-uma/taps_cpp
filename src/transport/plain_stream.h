@@ -30,45 +30,21 @@ inline asio::awaitable<Result<void>> drain_until_eof(asio::ip::tcp::socket& sock
     }
 }
 
-// A ByteStream that forwards directly to a connected TCP socket. Holds the socket
-// by reference: the owning TCPConnection keeps it alive (stream_ is declared after
-// socket_, so it is destroyed first). This is the behaviour of the connection
-// before any security is applied.
-class PlainStream : public ByteStream {
+// A ByteStream over a connected TCP socket, held by reference: the owning
+// TCPConnection keeps it alive (stream_ is declared after socket_, so it is
+// destroyed first).
+class PlainStream final : public AsioStream<asio::ip::tcp::socket&> {
 public:
-    explicit PlainStream(asio::ip::tcp::socket& socket) noexcept : socket_(socket) {}
-
-    asio::awaitable<Result<std::size_t>> read_some(asio::mutable_buffer buffer) override {
-        asio::error_code ec;
-        const std::size_t n = co_await socket_.async_read_some(
-            buffer, asio::redirect_error(asio::use_awaitable, ec));
-        if (ec == asio::error::eof)
-            co_return std::size_t{0};
-        if (ec)
-            co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
-        co_return n;
-    }
-
-    asio::awaitable<Result<std::size_t>> write(
-        std::span<const asio::const_buffer> buffers) override {
-        asio::error_code ec;
-        const std::size_t n = co_await asio::async_write(
-            socket_, buffers, asio::redirect_error(asio::use_awaitable, ec));
-        if (ec)
-            co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
-        co_return n;
-    }
+    explicit PlainStream(asio::ip::tcp::socket& socket) noexcept
+        : AsioStream<asio::ip::tcp::socket&>(socket) {}
 
     asio::awaitable<Result<void>> shutdown() override {
         asio::error_code ec;
-        socket_.shutdown(asio::ip::tcp::socket::shutdown_send, ec);
+        stream_.shutdown(asio::ip::tcp::socket::shutdown_send, ec);
         if (ec)
             co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
-        co_return co_await drain_until_eof(socket_);
+        co_return co_await drain_until_eof(stream_);
     }
-
-private:
-    asio::ip::tcp::socket& socket_;
 };
 
 }  // namespace taps

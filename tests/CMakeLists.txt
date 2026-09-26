@@ -6,10 +6,11 @@ add_executable(framer_test  framer_test.cpp)
 add_executable(security_parameters_test security_parameters_test.cpp)
 add_executable(message_memory_test message_memory_test.cpp)
 add_executable(connection_test connection_test.cpp)
+add_executable(const_buffer_sequence_test const_buffer_sequence_test.cpp)
 
 # The block substrate lives under src/ as private headers.
 foreach(t buffer_smoke message_test framer_test security_parameters_test message_memory_test
-          connection_test)
+          connection_test const_buffer_sequence_test)
     target_include_directories(${t} PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(${t} PRIVATE taps_static)
     if(UNIX AND NOT APPLE)
@@ -34,6 +35,10 @@ if(TAPS_WITH_TLS)
     add_custom_target(tls_test_certs DEPENDS ${_tls_certs})
 
     find_package(OpenSSL REQUIRED)
+
+    # The TLS half of const_buffer_sequence_test's compile-time checks.
+    target_compile_definitions(const_buffer_sequence_test PRIVATE TAPS_WITH_TLS)
+    target_link_libraries(const_buffer_sequence_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_executable(tls_test tls_test.cpp)
     add_dependencies(tls_test tls_test_certs)
     target_include_directories(tls_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
