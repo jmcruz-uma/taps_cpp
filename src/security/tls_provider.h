@@ -28,8 +28,14 @@ public:
         secure(asio::ip::tcp::socket& socket, std::string server_name) override;
 
 private:
-    TlsProvider(asio::ssl::context context, Role role,
+    // Only create() can construct: the constructor needs this private type.
+    struct Key { explicit Key() = default; };
+
+public:
+    TlsProvider(Key, asio::ssl::context context, Role role,
                 std::vector<std::string> required_alpn);
+
+private:
 
     // ALPN select callback for the server side; reads alpn_wire_ via `arg`.
     static int alpn_select_cb(::SSL* ssl, const unsigned char** out, unsigned char* outlen,

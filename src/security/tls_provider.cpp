@@ -51,7 +51,7 @@ ProviderResult fail(std::string msg) {
 
 }  // namespace
 
-TlsProvider::TlsProvider(asio::ssl::context context, Role role,
+TlsProvider::TlsProvider(Key, asio::ssl::context context, Role role,
                          std::vector<std::string> required_alpn)
     : context_(std::move(context)),
       role_(role),
@@ -135,8 +135,8 @@ ProviderResult TlsProvider::create(const SecurityParameters& params, Role role) 
         }
     }
 
-    std::unique_ptr<TlsProvider> provider(
-        new TlsProvider(std::move(context), role, std::move(required_alpn)));
+    auto provider = std::make_unique<TlsProvider>(Key{}, std::move(context), role,
+                                                  std::move(required_alpn));
 
     if (role == Role::Server && !wire.empty()) {
         provider->alpn_wire_ = std::move(wire);
