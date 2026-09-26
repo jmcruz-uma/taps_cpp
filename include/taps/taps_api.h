@@ -439,7 +439,9 @@ public:
     // The payload as its constituent contiguous segments, in order (one segment
     // per pooled block; a single segment for the vector / span variants). Zero
     // copy and no allocation: a forward range of std::span<const std::byte>. The
-    // range and each span are valid for the lifetime of this Message.
+    // range and each span are valid for the lifetime of this Message. For a
+    // received Message the segments are always its blocks, also after as_bytes()
+    // has built a contiguous copy.
     class Segments;
     Segments blocks() const noexcept;
 
@@ -532,6 +534,13 @@ enum class ConnectionState {
 // Core TAPS Interfaces
 // ============================================================================
 
+// Concurrency: the operations of one Connection (send, receive, close, abort) must
+// not run at the same time on different threads. Several coroutines may use one
+// Connection as long as they are serialised: all on a single-threaded io_context,
+// or all on one strand. One chain of operations at a time (receive, then send,
+// then close...) is always safe. Over TLS this also rules out full duplex from
+// several threads (a receive in one coroutine and a send in another, unserialised):
+// both directions share one TLS session.
 class Connection {
 public:
     virtual ~Connection() = default;

@@ -57,6 +57,12 @@ public:
     // source leaves the table, so a later datagram from it creates a new one.
     void release(const asio::ip::udp::endpoint& source, const Mailbox* mailbox);
 
+    // The shared socket. Every PassiveUDPConnection of the Listener sends on it,
+    // from its own coroutine (on any thread), while receive_loop() reads on strand_.
+    // asio guarantees concurrent use of one socket object only for its synchronous
+    // operations; for the asynchronous ones used here this relies on the Linux epoll
+    // backend, which locks each descriptor's operation queues. Sending through
+    // strand_ would make it a guarantee, at the cost of serialising every send.
     asio::ip::udp::socket& socket() noexcept { return socket_; }
 
 private:

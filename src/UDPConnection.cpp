@@ -32,6 +32,10 @@ TAPSError cancelled(ErrorEvent event, bool aborted) {
 
 // A socket failure during send or receive. UDP ends a Connection only on Abort
 // (RFC 9623 Section 10.3), so any other failure concerns this operation only.
+// Not implemented yet: RFC 9623 Section 10.3 reports ICMP errors (e.g. port
+// unreachable) as SoftError events. The sockets here are not connected, and on an
+// unconnected socket Linux does not report ICMP errors by default (IP_RECVERR
+// would be needed), so they are not seen at all.
 TAPSError udp_failure(ErrorEvent event, const std::error_code& ec, bool aborted) {
     if (ec == asio::error::operation_aborted)
         return cancelled(event, aborted);

@@ -174,6 +174,41 @@ Values: `REQUIRE`, `PREFER`, `IGNORE`, `AVOID`, `PROHIBIT`.
 
 Assign a framer to a connection with `conn->set_framer(std::make_unique<MyFramer>(...))`.
 
+## Known limitations
+
+- **One Connection, one thread at a time.** The operations of a Connection must not
+  run concurrently on different threads: use a single-threaded `io_context`, one
+  chain of operations per Connection, or one strand for every coroutine that uses it.
+  Over TLS this includes full duplex (receiving and sending from two coroutines on
+  different threads), because both directions share one TLS session. A concurrency
+  model of the library's own, independent of the asynchronous backend, is future work.
+- **`Message::as_bytes()` is not `const`.** For a received Message spread over several
+  blocks it copies the payload, on the first call, into a buffer the Message keeps;
+  two threads must not call it on the same Message at once. `Message::blocks()` and
+  `taps::gather()` read a Message without that copy and are `const`.
+- **Protocol selection and racing** (RFC 9623 Section 4): the protocol is TCP when
+  reliability is required or preferred, UDP otherwise; candidates are not gathered and
+  raced across protocol stacks. Racing (RFC 9623 Section 4.3, RFC 8305) covers the
+  addresses of TCP's remote endpoints, one attempt after another rather than staggered
+  attempts that overlap.
+- **Security**: the only security protocol is TLS over TCP. RFC 9621 does not tie the
+  Security Parameters to a protocol; security for datagrams (e.g. DTLS) or integrated
+  in the transport (e.g. QUIC) is not available, and requesting security over UDP
+  fails with `NO_CANDIDATES`.
+- **UDP soft errors** (RFC 9623 Section 10.3): not yet implemented. ICMP errors such as
+  "port unreachable" are not reported as `SoftError` events; on the unconnected sockets
+  used for UDP they are not seen at all.
+- **Connections from one UDP Listener share its socket**, and send on it from any thread
+  while the Listener receives. asio guarantees concurrent use of one socket object only
+  for synchronous operations; taps_cpp relies on the Linux epoll backend, which locks
+  each socket's asynchronous operation queues.
+- **Passive UDP on a multi-threaded `io_context`.** A UDP Listener receives on one strand,
+  which it shares with the receive queues of all its Connections. Receivers resuming on
+  other threads compete for that strand, and under a sustained stream of incoming
+  datagrams the Listener falls behind and the kernel drops datagrams; on a
+  single-threaded `io_context` it keeps up. Sending is not affected. Reducing this
+  contention is future work.
+
 ## License
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
