@@ -934,6 +934,32 @@ static void test_udp_source_after_connection_destroyed() {
     check_finished(finished, "udp new connection test");
 }
 
+// An active UDP Connection reserves its local port at initiate (RFC 9623 Section
+// 10.3): it can receive before it has sent anything.
+static void test_udp_receive_before_send() {
+    constexpr std::uint16_t port = 19963;          // the peer's port; nothing listens on it
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto pc = ts.preconnect(LocalEndpoint{}, RemoteEndpoint{"127.0.0.1", port}, udp_props());
+        auto cr = co_await pc.initiate();
+        if (!cr) { CHECK(false, "udp receive before send: initiate"); co_return; }
+        auto conn = std::move(*cr);
+        const auto local = conn->get_local_endpoint();
+        CHECK(conn->state() == ConnectionState::ESTABLISHED && local.port() != 0,
+              "udp: initiate reserves a local port and the connection is ESTABLISHED");
+        asio::ip::udp::socket peer(ctx, asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+        co_await udp_send_byte(peer, local.port(), 'r');
+        auto r = co_await conn->receive();
+        CHECK(one_byte(r, 'r'), "udp: an active connection receives before sending anything");
+        co_await conn->close();
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(5));
+    check_finished(finished, "udp receive before send test");
+}
+
 int main() {
     test_unframed_stream();
     test_framed_records();
@@ -954,6 +980,7 @@ int main() {
     test_establishment_errors();
     test_udp_echo();
     test_udp_idle_eviction();
+    test_udp_receive_before_send();
     test_udp_connection_outlives_listener();
     test_udp_listener_stop();
     test_udp_source_after_connection_destroyed();

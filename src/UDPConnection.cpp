@@ -165,20 +165,25 @@ ActiveUDPConnection::ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::e
 
 ActiveUDPConnection::~ActiveUDPConnection() = default;
 
+Result<void> ActiveUDPConnection::open() {
+    asio::error_code ec;
+    socket_.open(remote_endpoint_.protocol(), ec);
+    if (!ec)
+        socket_.bind(asio::ip::udp::endpoint(remote_endpoint_.protocol(), 0), ec);
+    if (ec)
+        return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, ec));
+    state_ = ConnectionState::ESTABLISHED;
+    return Result<void>{std::in_place};
+}
+
 
 asio::awaitable<Result<void>> ActiveUDPConnection::send(const Message& message) {
-    if (state_ == ConnectionState::CLOSED) {
+    if (state_ != ConnectionState::ESTABLISHED) {
         co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::INVALID_STATE,
-                                            "Connection is closed"));
+                                            "Connection not established"));
     }
     
     try {
-        // Open socket if not already open
-        if (!socket_.is_open()) {
-            socket_.open(remote_endpoint_.protocol());
-            state_ = ConnectionState::ESTABLISHED;
-        }
-        
         const auto body = message.as_bytes();
         std::array<std::byte, 64> hdr;
         std::size_t hn = 0;
@@ -208,15 +213,11 @@ asio::awaitable<Result<void>> ActiveUDPConnection::send(const Message& message) 
 }
 
 asio::awaitable<Result<Message>> ActiveUDPConnection::receive() {
-    if (state_ == ConnectionState::CLOSED) {
+    if (state_ != ConnectionState::ESTABLISHED) {
         co_return std::unexpected(TAPSError(ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE,
-                                            "Connection is closed"));
+                                            "Connection not established"));
     }
     
-    if (state_ == ConnectionState::ESTABLISHING) {
-        co_return std::unexpected(TAPSError(ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE,
-                                            "This connection needs to send before receive any data"));
-    }
 
     try {
         // Read straight into a pooled block; deliver the datagram as a

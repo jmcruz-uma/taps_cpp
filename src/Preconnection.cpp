@@ -72,7 +72,8 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
 
         try {
             auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint, memory_);
-
+            if (auto opened = udp_conn->open(); !opened)
+                co_return std::unexpected(opened.error());
             co_return std::unique_ptr<Connection>(std::move(udp_conn));
         } catch (const std::exception& e) {
             co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));

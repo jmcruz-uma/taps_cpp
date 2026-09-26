@@ -815,8 +815,10 @@ public:
     asio::awaitable<Result<void>> close() override;
     asio::awaitable<Result<void>> abort() override;
 
-    // The socket is opened by the first send(): sending is possible before then.
-    bool can_send() const noexcept override { return state_ != ConnectionState::CLOSED; }
+    // Reserves the local port (RFC 9623 Section 10.3, Initiate): opens and binds the
+    // socket to an ephemeral port; the Connection is then ESTABLISHED. Called by
+    // Preconnection::initiate().
+    Result<void> open();
 
     RemoteEndpoint get_remote_endpoint() const override;
     LocalEndpoint get_local_endpoint() const override;
