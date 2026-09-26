@@ -6,6 +6,7 @@
 #include "buffer/message_block_pool.h"
 #include "taps/taps_api.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -255,6 +256,141 @@ static void test_chain_first_slice() {
     CHECK(all.size() == 24);
 }
 
+// Up to two entries live inside the chain: no allocation beyond the blocks.
+static void test_chain_inline_entries() {
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 64));
+    BlockChain chain;
+    chain.append(make_filled(pool, 64, 0));
+    chain.append(make_filled(pool, 64, 64));
+    CHECK(chain.block_count() == 2);
+    CHECK(res.outstanding() == 4);              // two blocks, header + payload each
+}
+
+// A ref that continues the last one in the same block extends it; any other ref
+// is a new entry.
+static void test_chain_merges_contiguous_refs() {
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 64));
+    BlockRef block = pool.acquire();
+    for (std::size_t i = 0; i < 30; ++i)
+        block.writable_data()[i] = static_cast<std::byte>(i);
+    BlockChain chain;
+    BlockRef a = block; a.set_range(0, 10);
+    BlockRef b = block; b.set_range(10, 25);
+    BlockRef c = block; c.set_range(26, 30);     // gap: not contiguous with b
+    chain.append(a);
+    chain.append(b);
+    CHECK(chain.block_count() == 1 && chain.size() == 25);
+    chain.append(c);
+    CHECK(chain.block_count() == 2 && chain.size() == 29);
+    std::vector<std::byte> out(chain.size());
+    chain.copy_to(out);
+    for (std::size_t i = 0; i < 25; ++i)
+        CHECK(out[i] == static_cast<std::byte>(i));
+    for (std::size_t i = 0; i < 4; ++i)
+        CHECK(out[25 + i] == static_cast<std::byte>(26 + i));
+}
+
+// Beyond two entries the storage comes from the blocks' resource and goes back
+// to it; copies and moves keep the bytes and the ownership right.
+static void test_chain_overflow_copy_move() {
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 16));
+    {
+        BlockChain chain;
+        for (std::uint8_t i = 0; i < 5; ++i)
+            chain.append(make_filled(pool, 16, static_cast<std::uint8_t>(i * 16)));
+        CHECK(chain.block_count() == 5 && chain.size() == 80);
+        CHECK(res.outstanding() == 5 * 2 + 1);   // blocks + one entry array
+
+        BlockChain copy = chain;                  // shares blocks, own entry array
+        CHECK(copy.size() == 80 && copy.block_count() == 5);
+        CHECK(res.outstanding() == 5 * 2 + 2);
+        BlockChain moved = std::move(chain);      // takes the array
+        CHECK(moved.size() == 80 && chain.size() == 0 && chain.block_count() == 0);
+        CHECK(res.outstanding() == 5 * 2 + 2);
+
+        std::vector<std::byte> a(80), b(80);
+        copy.copy_to(a);
+        moved.copy_to(b);
+        CHECK(a == b);
+        for (std::size_t i = 0; i < 80; ++i)
+            CHECK(a[i] == static_cast<std::byte>(static_cast<std::uint8_t>(i)));
+
+        BlockChain small;                         // inline move
+        small.append(make_filled(pool, 16, 0));
+        BlockChain small_moved = std::move(small);
+        CHECK(small_moved.size() == 16 && small_moved.block_count() == 1 && small.empty());
+    }
+    CHECK(res.outstanding() == 0);
+}
+
+// A chain held by a Message comes from the resource.
+static void test_make_chain_from_resource() {
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 16));
+    {
+        auto chain = make_chain(&res);
+        CHECK(res.outstanding() == 1);
+        chain->append(make_filled(pool, 16, 0));
+        CHECK(res.outstanding() == 3);
+    }
+    CHECK(res.outstanding() == 0);
+}
+
+// The receive chain's pattern — appends of varying size, sometimes continuing a
+// block, consumes and slices interleaved — against a byte-for-byte model.
+static void test_chain_against_model() {
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 32));
+    BlockChain chain;
+    std::vector<std::uint8_t> model;             // the bytes the chain must hold
+    std::uint32_t rng = 12345;
+    auto next = [&rng] { rng = rng * 1103515245u + 12345u; return (rng >> 16) & 0x7fffu; };
+    std::uint8_t counter = 0;
+    BlockRef current = pool.acquire();
+    std::size_t used = 0;
+    for (int step = 0; step < 5000; ++step) {
+        const unsigned op = next() % 4;
+        if (op <= 1) {                            // append 1..20 bytes, continuing the block if it fits
+            std::size_t n = 1 + next() % 20;
+            if (used + n > 32) { current = pool.acquire(); used = 0; }
+            n = std::min<std::size_t>(n, 32 - used);
+            for (std::size_t i = 0; i < n; ++i) {
+                current.block()->data()[used + i] = static_cast<std::byte>(counter);
+                model.push_back(counter++);
+            }
+            BlockRef piece(current.block(), used, used + n);
+            used += n;
+            chain.append(std::move(piece));
+        } else if (op == 2) {                     // consume a few bytes
+            const std::size_t n = std::min<std::size_t>(next() % 25, model.size());
+            chain.consume_front(n);
+            model.erase(model.begin(), model.begin() + static_cast<std::ptrdiff_t>(n));
+        } else {                                  // slice and compare
+            const std::size_t n = std::min<std::size_t>(next() % 40, model.size());
+            const BlockChain slice = chain.first(n);
+            std::vector<std::byte> out(slice.size());
+            slice.copy_to(out);
+            bool same = slice.size() == n;
+            for (std::size_t i = 0; same && i < n; ++i)
+                same = out[i] == static_cast<std::byte>(model[i]);
+            CHECK(same);
+        }
+        CHECK(chain.size() == model.size());
+    }
+    std::vector<std::byte> out(chain.size());
+    chain.copy_to(out);
+    bool same = true;
+    for (std::size_t i = 0; same && i < model.size(); ++i)
+        same = out[i] == static_cast<std::byte>(model[i]);
+    CHECK(same);
+    current.reset();
+    chain = BlockChain{};
+    CHECK(res.outstanding() == 0);
+}
+
 int main() {
     test_pool_acquire_release();
     test_recycling_by_pool_resource();
@@ -264,6 +400,11 @@ int main() {
     test_chain_append_and_linearize();
     test_chain_consume_front();
     test_chain_first_slice();
+    test_chain_inline_entries();
+    test_chain_merges_contiguous_refs();
+    test_chain_overflow_copy_move();
+    test_make_chain_from_resource();
+    test_chain_against_model();
 
     if (g_failures == 0) {
         std::printf("buffer_smoke: OK\n");

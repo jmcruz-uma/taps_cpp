@@ -289,7 +289,7 @@ namespace taps {
                     receive_chain_->consume_front(pr.discard_before);
 
                 // The record is a refcounted slice of the chain — no payload copy.
-                auto slice = std::make_shared<BlockChain>(receive_chain_->first(pr.deliver));
+                auto slice = make_chain(block_pool_->resource(), receive_chain_->first(pr.deliver));
                 receive_chain_->consume_front(pr.deliver);
                 message_open_ = !pr.end_of_message;
                 Message m(std::move(slice), MessageContext{}, pr.end_of_message);
@@ -315,7 +315,7 @@ namespace taps {
                         ErrorEvent::RECEIVE_ERROR, ErrorReason::DEFRAMING_FAILED, what}));
                 }
                 receive_ended_ = true;
-                co_return Message(std::make_shared<BlockChain>(), MessageContext{},
+                co_return Message(make_chain(block_pool_->resource()), MessageContext{},
                                   /*end_of_message=*/true);
             }
 
@@ -340,11 +340,11 @@ namespace taps {
         if (!*chunk) {
             // The peer ended its side: final fragment, empty, endOfMessage = true.
             receive_ended_ = true;
-            co_return Message(std::make_shared<BlockChain>(), MessageContext{},
+            co_return Message(make_chain(block_pool_->resource()), MessageContext{},
                               /*end_of_message=*/true);
         }
 
-        auto chain = std::make_shared<BlockChain>();
+        auto chain = make_chain(block_pool_->resource());
         chain->append(std::move(*chunk));
         co_return Message(std::move(chain), MessageContext{}, /*end_of_message=*/false);
     }

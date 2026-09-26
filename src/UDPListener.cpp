@@ -98,7 +98,7 @@ asio::awaitable<void> UDPDemux::receive_loop() {
         if (ec)
             continue;                             // transient receive error
 
-        auto datagram = std::make_shared<BlockChain>();
+        auto datagram = make_chain(pool_->resource());
         if (n > 0) {
             block.set_range(0, n);
             datagram->append(std::move(block));

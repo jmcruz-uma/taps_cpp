@@ -231,7 +231,7 @@ asio::awaitable<Result<Message>> ActiveUDPConnection::receive() {
             asio::buffer(block.writable_data(), block.capacity_after_begin()),
             sender_endpoint, asio::use_awaitable);
 
-        auto chain = std::make_shared<BlockChain>();
+        auto chain = make_chain(block_pool_->resource());
         if (n > 0) {
             block.set_range(0, n);
             chain->append(std::move(block));
