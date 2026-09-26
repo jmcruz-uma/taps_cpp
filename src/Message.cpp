@@ -48,19 +48,18 @@ std::span<const std::byte> Message::as_bytes() const {
     return std::as_bytes(span_view_);
 }
 
-std::vector<std::span<const std::byte>> Message::blocks() const {
-    std::vector<std::span<const std::byte>> out;
-    if (chain_) {
-        out.reserve(chain_->block_count());
-        for (const BlockRef& b : *chain_)
-            out.push_back(b.bytes());
-        return out;
-    }
+std::size_t Message::segment_count() const noexcept {
+    if (chain_)
+        return chain_->block_count();
+    return 1;
+}
+
+std::span<const std::byte> Message::segment(std::size_t i) const noexcept {
+    if (chain_)
+        return (chain_->begin() + i)->bytes();
     if (owning_)
-        out.push_back(std::as_bytes(std::span<const std::uint8_t>(owned_data_)));
-    else
-        out.push_back(std::as_bytes(span_view_));
-    return out;
+        return std::as_bytes(std::span<const std::uint8_t>(owned_data_));
+    return std::as_bytes(span_view_);
 }
 
 // Free function: gather into the caller's buffer, no internal allocation.

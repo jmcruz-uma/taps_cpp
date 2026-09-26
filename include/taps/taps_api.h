@@ -15,6 +15,7 @@
 #include <map>
 #include <list>
 #include <memory>
+#include <iterator>
 #include <memory_resource>
 #include <functional>
 #include <chrono>
@@ -431,8 +432,10 @@ public:
 
     // The payload as its constituent contiguous segments, in order (one segment
     // per pooled block; a single segment for the vector / span variants). Zero
-    // copy. Each span is valid for the lifetime of this Message.
-    std::vector<std::span<const std::byte>> blocks() const;
+    // copy and no allocation: a forward range of std::span<const std::byte>. The
+    // range and each span are valid for the lifetime of this Message.
+    class Segments;
+    Segments blocks() const noexcept;
 
     // The block chain backing this Message, or nullptr for the vector / span
     // variants. Used by the transport send path for gather-write; BlockChain is
@@ -443,6 +446,10 @@ public:
     void set_context(MessageContext context) { context_ = std::move(context); }
 
 private:
+    friend class Segments;
+    std::size_t segment_count() const noexcept;
+    std::span<const std::byte> segment(std::size_t i) const noexcept;
+
     // Gathers the chain into gathered_ on first call and returns a view of it.
     // Only meaningful when chain_ != nullptr.
     std::span<const std::byte> ensure_gathered() const;
@@ -457,6 +464,45 @@ private:
     bool                              end_of_message_ = true;
     MessageContext                    context_;
 };
+
+// The range Message::blocks() returns.
+class Message::Segments {
+public:
+    class iterator {
+    public:
+        using value_type        = std::span<const std::byte>;
+        using difference_type   = std::ptrdiff_t;
+        using iterator_concept  = std::forward_iterator_tag;
+        using iterator_category = std::forward_iterator_tag;
+
+        iterator() noexcept = default;
+        value_type operator*() const noexcept { return msg_->segment(i_); }
+        iterator& operator++() noexcept { ++i_; return *this; }
+        iterator operator++(int) noexcept { iterator old = *this; ++i_; return old; }
+        bool operator==(const iterator&) const noexcept = default;
+
+    private:
+        friend class Segments;
+        iterator(const Message* msg, std::size_t i) noexcept : msg_(msg), i_(i) {}
+        const Message* msg_ = nullptr;
+        std::size_t    i_ = 0;
+    };
+
+    iterator    begin() const noexcept { return {msg_, 0}; }
+    iterator    end()   const noexcept { return {msg_, count_}; }
+    std::size_t size()  const noexcept { return count_; }
+    bool        empty() const noexcept { return count_ == 0; }
+
+private:
+    friend class Message;
+    Segments(const Message* msg, std::size_t count) noexcept : msg_(msg), count_(count) {}
+    const Message* msg_;
+    std::size_t    count_;
+};
+
+inline Message::Segments Message::blocks() const noexcept {
+    return Segments(this, segment_count());
+}
 
 // ============================================================================
 // Message Framing — see taps/message_framer.h (MessageFramer API v2, RFC 9623 §6)

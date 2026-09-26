@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
@@ -75,8 +76,13 @@ static void test_vector_variant() {
 
     const auto segs = m.blocks();
     CHECK(segs.size() == 1);              // contiguous -> a single segment
-    CHECK(segs[0].size() == 4);
+    CHECK((*segs.begin()).size() == 4);
 }
+
+// blocks() is a forward range of spans, usable with range-for and <ranges>.
+static_assert(std::ranges::forward_range<Message::Segments>);
+static_assert(std::ranges::sized_range<Message::Segments>);
+static_assert(std::same_as<std::ranges::range_value_t<Message::Segments>, std::span<const std::byte>>);
 
 static void test_span_variant() {
     std::vector<std::uint8_t> src{1, 2, 3, 4, 5};
@@ -90,7 +96,7 @@ static void test_span_variant() {
     // as_bytes() on the span variant is a view over the caller's data, no copy.
     CHECK(m.as_bytes().data() == reinterpret_cast<const std::byte*>(src.data()));
     CHECK(m.blocks().size() == 1);
-    CHECK(m.blocks()[0].data() == reinterpret_cast<const std::byte*>(src.data()));
+    CHECK((*m.blocks().begin()).data() == reinterpret_cast<const std::byte*>(src.data()));
 }
 
 static void test_chain_as_bytes() {
