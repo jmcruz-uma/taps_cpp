@@ -22,7 +22,7 @@ class BlockChain;  // src/buffer/block_chain.h (private) — one datagram per ch
 // ==============================
 //
 // Per-logical-UDP-connection queue of received datagrams. Each datagram is a
-// single-block BlockChain drawn from the UDPListener's BlockPool; nothing here
+// single-block BlockChain from the UDP Listener's message blocks; nothing here
 // copies the payload.
 //
 // The queue is a bounded ring. UDP has no transport flow control, so when a slow

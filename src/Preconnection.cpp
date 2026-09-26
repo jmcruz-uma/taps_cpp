@@ -16,11 +16,11 @@ namespace taps {
 // SecurityProvider is complete.
 Preconnection::Preconnection(asio::io_context& ctx, LocalEndpoint local, RemoteEndpoint remote,
                              TransportProperties props, SecurityParameters security,
-                             std::shared_ptr<BlockPoolFactory> pool_factory)
+                             MessageMemoryConfig memory)
     : io_context_(ctx), local_endpoint_(std::move(local)),
       transport_properties_(std::move(props)),
       security_parameters_(std::move(security)),
-      pool_factory_(std::move(pool_factory)) {
+      memory_(memory) {
     remote_endpoints_.push_back(std::move(remote));
 }
 
@@ -54,7 +54,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
     if (transport_properties_.requires_reliable_transport()) {
         // TCP
         try {
-            auto tcp_conn = std::make_unique<TCPConnection>(io_context_, endpoint, pool_factory_);
+            auto tcp_conn = std::make_unique<TCPConnection>(io_context_, endpoint, memory_);
 
             auto connect_result = co_await tcp_conn->connect();
             if (!connect_result) {
@@ -71,7 +71,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
         asio::ip::udp::endpoint udp_endpoint(endpoint.address(), endpoint.port());
 
         try {
-            auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint, pool_factory_);
+            auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint, memory_);
 
             co_return std::unique_ptr<Connection>(std::move(udp_conn));
         } catch (const std::exception& e) {
@@ -139,7 +139,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::race_connect
     TAPSError last_error{ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::ESTABLISHMENT_FAILED, "No endpoints attempted"};
 
     for (std::size_t i = 0; i < endpoints.size(); ++i) {
-        auto conn = std::make_unique<TCPConnection>(io_context_, endpoints[i], pool_factory_);
+        auto conn = std::make_unique<TCPConnection>(io_context_, endpoints[i], memory_);
 
         auto connect_result = co_await conn->connect();
         if (connect_result) {

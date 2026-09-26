@@ -15,6 +15,7 @@
 #include <map>
 #include <list>
 #include <memory>
+#include <memory_resource>
 #include <functional>
 #include <chrono>
 #include <cstddef>
@@ -30,10 +31,9 @@ namespace taps {
 class Message;
 class MessageContext;
 class MessageFramer;
-class BlockChain;  // src/buffer/block_chain.h — receive-path substrate (private)
-class BlockPool;   // src/buffer/block_pool.h  — receive-path substrate (private)
-class BlockRef;    // src/buffer/block.h       — receive-path substrate (private)
-class BlockPoolFactory;
+class BlockChain;        // src/buffer/block_chain.h — receive-path substrate (private)
+class BlockRef;          // src/buffer/block.h       — receive-path substrate (private)
+class MessageBlockPool;  // src/buffer/message_block_pool.h (private)
 class ByteStream;        // src/transport/byte_stream.h — I/O transport (plain socket or TLS)
 class SecurityProvider;  // src/security/security_provider.h — applies TLS at establishment
 class Connection;
@@ -537,6 +537,38 @@ protected:
     bool is_listening_ = false;
 };
 
+// ============================================================================
+// Message memory
+// ============================================================================
+//
+// RFC 9622/9623 leave the ownership and storage of Message data to the
+// implementation. In taps_cpp, all memory that holds or describes message data
+// (received blocks, block lists, the contiguous buffer as_bytes() builds) comes
+// from one std::pmr::memory_resource, chosen here. Nothing else uses it.
+//
+// The resource must outlive every Connection, Listener and Message that uses it.
+//
+// THE DEFAULT RESOURCE IS NOT THREAD-SAFE. It is a process-wide
+// std::pmr::unsynchronized_pool_resource with message_pool_options(), which
+// recycles the receive blocks. If the io_context runs on several threads and more
+// than one coroutine receives or holds received Messages, pass a thread-safe
+// resource, for example a std::pmr::synchronized_pool_resource built with
+// message_pool_options().
+struct MessageMemoryConfig {
+    std::pmr::memory_resource* resource = nullptr;  // nullptr: default_message_resource()
+    std::size_t block_size = 64 * 1024;             // bytes per receive block
+    std::size_t max_live_blocks = 0;                // per Connection (or UDP Listener);
+                                                    // 0 = no cap. At the cap, receive()
+                                                    // fails with RESOURCE_EXHAUSTED.
+};
+
+// Pool options for message memory: blocks up to 64 KiB (the default block size)
+// are pooled, in chunks of at most 16 blocks.
+std::pmr::pool_options message_pool_options() noexcept;
+
+// The process-wide default resource (not thread-safe; see MessageMemoryConfig).
+std::pmr::memory_resource* default_message_resource();
+
 class Preconnection {
 public:
     // Out-of-line (defined in Preconnection.cpp): security_provider_ is a unique_ptr
@@ -544,7 +576,7 @@ public:
     // must be emitted where SecurityProvider is complete.
     Preconnection(asio::io_context& ctx, LocalEndpoint local, RemoteEndpoint remote,
                   TransportProperties props, SecurityParameters security,
-                  std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+                  MessageMemoryConfig memory = {});
     ~Preconnection();
 
     asio::awaitable<Result<std::unique_ptr<Connection>>> initiate();
@@ -564,7 +596,7 @@ private:
     std::vector<RemoteEndpoint> remote_endpoints_;
     TransportProperties transport_properties_;
     SecurityParameters security_parameters_;
-    std::shared_ptr<BlockPoolFactory> pool_factory_;
+    MessageMemoryConfig memory_;
     // Built once, lazily, on the first establish_connection() that needs it.
     std::unique_ptr<SecurityProvider> security_provider_;
 
@@ -580,42 +612,20 @@ private:
     asio::awaitable<Result<std::unique_ptr<Connection>>> establish_connection(std::unique_ptr<TCPConnection> conn);
 };
 
-// A pluggable strategy for how each Connection obtains its receive-path
-// BlockPool — the injection point ACE would call an allocator strategy.
-// TransportServices owns one and threads it through every Preconnection /
-// Listener / Connection it creates, so an app that needs e.g. a pre-warmed,
-// bounded pool (no `new` once traffic starts — see HeapBlockPool's own
-// lazy-growth caveat) supplies one factory, once, instead of reaching into
-// every Connection subclass individually.
-//
-// make() is called once per Connection (or once per Listener, for the single
-// shared pool behind UDPListener) — never on the per-message hot path — so a
-// factory holding config (block size, pre-warm count, ...) and no other mutable
-// state is safe to share (shared_ptr) across everything TransportServices
-// spawns, without synchronization of its own.
-class BlockPoolFactory {
-public:
-    virtual ~BlockPoolFactory() = default;
-    virtual std::unique_ptr<BlockPool> make() const = 0;
-};
-
 // ============================================================================
 // Transport Services Main Interface
 // ============================================================================
 
 class TransportServices {
 public:
-    // pool_factory: nullptr (the default) keeps today's behaviour — every
-    // Connection gets its own HeapBlockPool. Supply one to override how ALL
-    // Connections spawned from this TransportServices obtain their pool.
-    explicit TransportServices(asio::io_context& ctx,
-                               std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+    // `memory` applies to every Connection and Listener created from here.
+    explicit TransportServices(asio::io_context& ctx, MessageMemoryConfig memory = {});
 
     Preconnection preconnect(LocalEndpoint local, RemoteEndpoint remote,
                            TransportProperties properties = {},
                            SecurityParameters security = {}) {
         return Preconnection(io_context_, std::move(local), std::move(remote),
-                           std::move(properties), std::move(security), pool_factory_);
+                           std::move(properties), std::move(security), memory_);
     }
 
     asio::awaitable<Result<std::unique_ptr<Listener>>> listen(
@@ -624,7 +634,7 @@ public:
 
 private:
     asio::io_context& io_context_;
-    std::shared_ptr<BlockPoolFactory> pool_factory_;
+    MessageMemoryConfig memory_;
 };
 
 // ============================================================================
@@ -634,9 +644,9 @@ private:
 class TCPConnection : public Connection {
 public:
     explicit TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint,
-                           std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+                           const MessageMemoryConfig& memory = {});
     explicit TCPConnection(asio::ip::tcp::socket socket,
-                           std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+                           const MessageMemoryConfig& memory = {});
     ~TCPConnection();  // out-of-line: block_pool_ is a pimpl to a private type
 
     asio::awaitable<Result<void>> send(const Message& message) override;
@@ -672,7 +682,7 @@ private:
     std::optional<asio::ip::tcp::endpoint> cached_local_endpoint_;
 
     // Pool of fixed-size blocks for the receive path (framed and no-framer).
-    std::unique_ptr<BlockPool> block_pool_;
+    std::unique_ptr<MessageBlockPool> block_pool_;
     // Bytes received but not yet parsed by the framer, behind the receive cursor.
     std::unique_ptr<BlockChain> receive_chain_;
     bool receive_eof_ = false;
@@ -745,7 +755,7 @@ class ActiveUDPConnection : public Connection {
 public:
 
     explicit ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::endpoint endpoint,
-                                 std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+                                 const MessageMemoryConfig& memory = {});
     ~ActiveUDPConnection();  // out-of-line: block_pool_ points to a private type
 
     asio::awaitable<Result<void>> send(const Message& message) override;
@@ -763,7 +773,7 @@ private:
     asio::ip::udp::socket socket_;
     asio::ip::udp::endpoint remote_endpoint_;
     // Fixed-size blocks for the receive path; one datagram per block, no copy.
-    std::unique_ptr<BlockPool> block_pool_;
+    std::unique_ptr<MessageBlockPool> block_pool_;
     bool aborted_ = false;
 };
 
@@ -772,7 +782,7 @@ public:
     explicit TCPListener(asio::io_context& ctx, LocalEndpoint local,
                         TransportProperties properties = {},
                         SecurityParameters security = {},
-                        std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+                        MessageMemoryConfig memory = {});
     ~TCPListener();  // out-of-line: security_provider_ is a unique_ptr to a private type
 
     asio::awaitable<Result<void>> listen() override;
@@ -786,8 +796,8 @@ public:
 private:
     asio::io_context& io_context_;
     asio::ip::tcp::acceptor acceptor_;
-    // Forwarded to each TCPConnection accept() spawns; see BlockPoolFactory.
-    std::shared_ptr<BlockPoolFactory> pool_factory_;
+    // Given to each TCPConnection accept() creates.
+    MessageMemoryConfig memory_;
     // Server-side TLS provider, built once (lazily) on the first accept() that
     // needs it when security_parameters_ request TLS.
     std::unique_ptr<SecurityProvider> security_provider_;
@@ -798,7 +808,7 @@ public:
     explicit UDPListener(asio::io_context& ctx, LocalEndpoint local,
                         TransportProperties properties = {},
                         SecurityParameters security = {},
-                        std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
+                        MessageMemoryConfig memory = {});
     // Stops accepting; Connections already accepted keep working (they share the
     // socket, which closes when the last of them goes).
     ~UDPListener();

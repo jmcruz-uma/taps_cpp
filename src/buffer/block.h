@@ -4,68 +4,73 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <memory_resource>
 #include <span>
 #include <utility>
 
 namespace taps {
 
-class BlockPool;
-class HeapBlockPool;
-
 // ============================================================================
 // DataBlock
 // ============================================================================
 //
-// Reference-counted fixed-size byte storage. Instances are created and owned by a
-// BlockPool; when the last reference is dropped the block returns to its pool's
-// free list (or is deleted if the pool's free list is full or the pool is gone).
+// Reference-counted fixed-size byte storage for received message data. The
+// header and the payload are two allocations from the message memory resource:
+// a payload of exactly the block size stays in the resource's size class for
+// that size (a pool resource recycles it), and it is never zero-filled (the
+// receive path only reads the bytes that arrived).
 //
-// The reference count is atomic, so a Message backed by these blocks may be moved
-// to another thread for consumption. The storage is allocated with
-// make_unique_for_overwrite: it is never zero-filled (RFC 9623 receive path only
-// writes the bytes it actually received).
+// When the last reference goes, the block returns its memory to the resource and,
+// if its pool caps live blocks, decrements the shared counter. It refers to
+// nothing else: a Message may outlive the Connection that received it. The
+// resource must outlive every block (the usual std::pmr contract).
 //
-// The owning BlockPool must outlive every block it hands out (same contract as a
-// std::pmr memory resource).
+// The reference count is atomic, so a Message backed by these blocks may be
+// moved to another thread; the resource then has to be thread-safe.
 class DataBlock {
 public:
-    DataBlock(BlockPool* pool, std::size_t capacity)
-        : pool_(pool),
-          capacity_(capacity),
-          storage_(std::make_unique_for_overwrite<std::byte[]>(capacity)) {}
+    using LiveCounter = std::atomic<std::size_t>;
 
-    std::byte*       data()       noexcept { return storage_.get(); }
-    const std::byte* data() const noexcept { return storage_.get(); }
+    // A block of `capacity` bytes from `resource`; `live`, if not null, counts it.
+    static DataBlock* create(std::pmr::memory_resource* resource, std::size_t capacity,
+                             std::shared_ptr<LiveCounter> live);
+
+    DataBlock(const DataBlock&) = delete;
+    DataBlock& operator=(const DataBlock&) = delete;
+
+    std::byte*       data()       noexcept { return storage_; }
+    const std::byte* data() const noexcept { return storage_; }
     std::size_t      capacity() const noexcept { return capacity_; }
 
-    // The pool this block was minted by (nullptr for a detached block). Lets a
-    // BlockChain built from this block's pool reach that pool's allocation hook
-    // for a same-strategy contiguous gather buffer (BlockPool::allocate_contiguous)
-    // instead of an unconditional global `new`.
-    BlockPool* pool() const noexcept { return pool_; }
+    // Where this block's memory comes from; also used for other message memory
+    // derived from it (a Message's contiguous as_bytes() buffer).
+    std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
     void add_ref() noexcept {
         refcount_.fetch_add(1, std::memory_order_relaxed);
     }
-    void release() noexcept;  // defined in block_pool.cpp (needs BlockPool)
+    void release() noexcept {
+        if (refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            destroy();
+    }
 
     std::uint32_t use_count() const noexcept {
         return refcount_.load(std::memory_order_acquire);
     }
 
 private:
-    friend class BlockPool;
-    // next_free_ is an intrusive link for a free-list-based strategy; only a
-    // strategy that actually keeps one needs it. HeapBlockPool is the only one
-    // today — a future arena/pmr strategy that doesn't use a free list wouldn't
-    // need this friendship at all.
-    friend class HeapBlockPool;
+    DataBlock(std::pmr::memory_resource* resource, std::byte* storage, std::size_t capacity,
+              std::shared_ptr<LiveCounter> live) noexcept
+        : resource_(resource), storage_(storage), capacity_(capacity), live_(std::move(live)) {}
+    ~DataBlock() = default;
 
-    BlockPool*                   pool_;                  // nullptr detaches the block
-    std::atomic<std::uint32_t>   refcount_{0};
+    void destroy() noexcept;
+
+    std::pmr::memory_resource*   resource_;
+    std::byte*                   storage_;
     std::size_t                  capacity_;
-    DataBlock*                   next_free_ = nullptr;   // free-list link, idle only
-    std::unique_ptr<std::byte[]> storage_;
+    std::atomic<std::uint32_t>   refcount_{0};
+    std::shared_ptr<LiveCounter> live_;      // null when the pool has no live-block cap
 };
 
 // ============================================================================

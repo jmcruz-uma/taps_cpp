@@ -2,8 +2,7 @@
 #include "taps/mailbox.h"
 #include "udp_demux.h"
 #include "buffer/block_chain.h"
-#include "buffer/block_pool.h"
-#include "buffer/heap_block_pool.h"
+#include "buffer/message_block_pool.h"
 #include "transport/io_error.h"
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -12,6 +11,7 @@
 #include <asio/post.hpp>
 #include <asio/redirect_error.hpp>
 #include <asio/use_awaitable.hpp>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <iterator>
@@ -47,7 +47,7 @@ std::chrono::seconds sweep_interval() {
 // UDPDemux
 // ============================================================================
 
-UDPDemux::UDPDemux(asio::io_context& ctx, std::unique_ptr<BlockPool> pool)
+UDPDemux::UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool)
 : socket_(ctx)
 , strand_(asio::make_strand(ctx))
 , pool_(std::move(pool))
@@ -78,6 +78,17 @@ asio::awaitable<void> UDPDemux::receive_loop() {
     asio::ip::udp::endpoint sender;
     for (;;) {
         BlockRef block = pool_->acquire();
+        if (!block) {
+            // At the live-block cap: read the datagram and drop it (UDP has no flow
+            // control; the Mailboxes drop the oldest datagram for the same reason).
+            std::array<std::byte, 1> sink;
+            asio::error_code ec;
+            co_await socket_.async_receive_from(asio::buffer(sink), sender,
+                                                asio::redirect_error(asio::use_awaitable, ec));
+            if (ec == asio::error::operation_aborted)
+                co_return;
+            continue;
+        }
         asio::error_code ec;
         const std::size_t n = co_await socket_.async_receive_from(
             asio::buffer(block.writable_data(), block.capacity_after_begin()),
@@ -185,10 +196,10 @@ UDPListener::UDPListener(
     LocalEndpoint local,
     TransportProperties properties,
     SecurityParameters security,
-    std::shared_ptr<BlockPoolFactory> pool_factory)
+    MessageMemoryConfig memory)
 : io_context_(ctx)
 , demux_(std::make_shared<UDPDemux>(
-      ctx, pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()))
+      ctx, std::make_unique<MessageBlockPool>(memory)))
 {
     local_endpoint_       = std::move(local);
     transport_properties_ = std::move(properties);

@@ -11,8 +11,6 @@
 #include "taps/taps_api.h"
 #include "taps/message_framer.h"
 
-#include "buffer/heap_block_pool.h"
-
 #include <asio.hpp>
 
 #include <array>
@@ -426,18 +424,19 @@ static void test_echo(bool framed, std::uint16_t port, const char* name) {
 // the Connection (RFC 9622 Section 9.3.2.3): once the Messages are released, the
 // rest of the stream arrives.
 // ---------------------------------------------------------------------------
-struct CappedPoolFactory final : BlockPoolFactory {
-    std::unique_ptr<BlockPool> make() const override {
-        return std::make_unique<HeapBlockPool>(/*block_size=*/1024, /*max_free_blocks=*/4,
-                                               /*max_live_blocks=*/4);
-    }
-};
+// 1 KiB blocks, at most 4 live per Connection.
+static MessageMemoryConfig capped_memory() {
+    MessageMemoryConfig memory;
+    memory.block_size = 1024;
+    memory.max_live_blocks = 4;
+    return memory;
+}
 
 static void test_pool_exhaustion() {
     constexpr std::uint16_t port = 19986;
     const auto data = payload(3, 64u * 1024);
     scenario(send_once_server(port, data), [&data](asio::io_context& ctx) -> asio::awaitable<void> {
-        TransportServices ts(ctx, std::make_shared<CappedPoolFactory>());
+        TransportServices ts(ctx, capped_memory());
         auto conn = co_await connect_tcp(ts, port);
         if (!conn) co_return;
         std::vector<Message> kept;

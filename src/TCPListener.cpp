@@ -25,8 +25,8 @@ TCPListener::~TCPListener() = default;
 TCPListener::TCPListener(asio::io_context& ctx, LocalEndpoint local,
                         TransportProperties properties,
                         SecurityParameters security,
-                        std::shared_ptr<BlockPoolFactory> pool_factory)
-        : io_context_(ctx), acceptor_(ctx), pool_factory_(std::move(pool_factory)){
+                        MessageMemoryConfig memory)
+        : io_context_(ctx), acceptor_(ctx), memory_(memory){
             local_endpoint_ = std::move(local);
             transport_properties_ = std::move(properties);
             security_parameters_ = std::move(security);
@@ -100,7 +100,7 @@ asio::awaitable<Result<void>> TCPListener::listen() {
             if (ec)
                 co_return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, ec));
 
-            auto connection = std::make_unique<TCPConnection>(std::move(socket), pool_factory_);
+            auto connection = std::make_unique<TCPConnection>(std::move(socket), memory_);
 
             if (security_parameters_.is_enabled()) {
 #ifdef TAPS_WITH_TLS

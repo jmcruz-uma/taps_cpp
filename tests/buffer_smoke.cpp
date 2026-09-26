@@ -1,14 +1,16 @@
-// Smoke test for the block-chain receive substrate: BlockPool / DataBlock /
-// BlockRef / BlockChain. This exercises the substrate in isolation; it is not yet
-// wired into the TAPS receive path (that is a later commit).
+// Smoke test for the block-chain receive substrate: MessageBlockPool / DataBlock /
+// BlockRef / BlockChain, in isolation. Message memory comes from a counting
+// std::pmr resource, so the tests can see every allocation and its release.
 
 #include "buffer/block_chain.h"
-#include "buffer/block_pool.h"
-#include "buffer/heap_block_pool.h"
+#include "buffer/message_block_pool.h"
+#include "taps/taps_api.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <memory_resource>
 #include <span>
 #include <vector>
 
@@ -24,9 +26,41 @@ static int g_failures = 0;
         }                                                                     \
     } while (0)
 
+// Forwards to an upstream resource and counts calls and outstanding allocations.
+struct CountingResource final : std::pmr::memory_resource {
+    explicit CountingResource(std::pmr::memory_resource* up = std::pmr::new_delete_resource())
+        : upstream(up) {}
+    std::pmr::memory_resource* upstream;
+    std::size_t allocations = 0, deallocations = 0, largest = 0;
+    std::size_t outstanding() const { return allocations - deallocations; }
+
+    void* do_allocate(std::size_t n, std::size_t a) override {
+        ++allocations;
+        if (n > largest) largest = n;
+        return upstream->allocate(n, a);
+    }
+    void do_deallocate(void* p, std::size_t n, std::size_t a) override {
+        ++deallocations;
+        upstream->deallocate(p, n, a);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& o) const noexcept override { return this == &o; }
+};
+
+static MessageMemoryConfig config(std::pmr::memory_resource* r, std::size_t block_size,
+                                  std::size_t max_live_blocks = 0) {
+    MessageMemoryConfig c;
+    c.resource = r;
+    c.block_size = block_size;
+    c.max_live_blocks = max_live_blocks;
+    return c;
+}
+
+// A cap far above what any test uses, so live_blocks() reports the count.
+constexpr std::size_t kCounted = 1000;
+
 // Fills a fresh block from `pool` with `n` bytes of a recognisable pattern and
 // returns it as a BlockRef whose live window is [0, n).
-static BlockRef make_filled(BlockPool& pool, std::size_t n, std::uint8_t seed) {
+static BlockRef make_filled(MessageBlockPool& pool, std::size_t n, std::uint8_t seed) {
     BlockRef ref = pool.acquire();
     CHECK(ref.valid());
     std::byte* p = ref.writable_data();
@@ -36,42 +70,43 @@ static BlockRef make_filled(BlockPool& pool, std::size_t n, std::uint8_t seed) {
     return ref;
 }
 
+// A block is two allocations from the resource (header and payload, the payload
+// exactly block_size), both returned when the last reference goes.
 static void test_pool_acquire_release() {
-    HeapBlockPool pool(/*block_size=*/4096);
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 4096));
     CHECK(pool.block_size() == 4096);
-    CHECK(pool.live_blocks() == 0);
-    CHECK(pool.free_blocks() == 0);
-
+    CHECK(pool.resource() == &res);
     {
         BlockRef a = pool.acquire();
         CHECK(a.valid());
         CHECK(a.empty());                       // window starts at [0, 0)
         CHECK(a.capacity_after_begin() == 4096);
-        CHECK(pool.live_blocks() == 1);
         CHECK(a.block()->use_count() == 1);
+        CHECK(res.outstanding() == 2);
+        CHECK(res.largest == 4096);
     }
-    CHECK(pool.live_blocks() == 0);
-    CHECK(pool.free_blocks() == 1);             // recycled, not freed
+    CHECK(res.outstanding() == 0);
 }
 
-static void test_pool_recycles_same_storage() {
-    HeapBlockPool pool(4096);
-    DataBlock* first = nullptr;
-    {
-        BlockRef a = pool.acquire();
-        first = a.block();
-    }
-    CHECK(pool.free_blocks() == 1);
-    {
+// Recycling is the resource's: over a pool resource, a released block's memory is
+// reused without going back upstream.
+static void test_recycling_by_pool_resource() {
+    CountingResource upstream;
+    std::pmr::unsynchronized_pool_resource pooled(message_pool_options(), &upstream);
+    MessageBlockPool pool(config(&pooled, 4096));
+    { BlockRef warm = pool.acquire(); }
+    const std::size_t after_warm = upstream.allocations;
+    for (int i = 0; i < 10; ++i) {
         BlockRef b = pool.acquire();
-        CHECK(b.block() == first);              // pulled off the free list
-        CHECK(pool.free_blocks() == 0);
-        CHECK(pool.live_blocks() == 1);
+        CHECK(b.valid());
     }
+    CHECK(upstream.allocations == after_warm);
 }
 
 static void test_blockref_shared_ownership() {
-    HeapBlockPool pool(4096);
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 4096, kCounted));
     BlockRef a = pool.acquire();
     CHECK(a.block()->use_count() == 1);
     {
@@ -83,25 +118,12 @@ static void test_blockref_shared_ownership() {
     CHECK(a.block()->use_count() == 1);
     a.reset();
     CHECK(pool.live_blocks() == 0);
-    CHECK(pool.free_blocks() == 1);
-}
-
-static void test_free_list_cap() {
-    HeapBlockPool pool(/*block_size=*/1024, /*max_free_blocks=*/2);
-    {
-        BlockRef r0 = pool.acquire();
-        BlockRef r1 = pool.acquire();
-        BlockRef r2 = pool.acquire();
-        BlockRef r3 = pool.acquire();
-        CHECK(pool.live_blocks() == 4);
-    }
-    // Four released, only two retained; the other two were freed.
-    CHECK(pool.live_blocks() == 0);
-    CHECK(pool.free_blocks() == 2);
+    CHECK(res.outstanding() == 1);              // only the shared cap counter remains
 }
 
 static void test_live_cap_backpressure() {
-    HeapBlockPool pool(/*block_size=*/1024, /*max_free_blocks=*/8, /*max_live_blocks=*/3);
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 1024, /*max_live_blocks=*/3));
     BlockRef r0 = pool.acquire();
     BlockRef r1 = pool.acquire();
     BlockRef r2 = pool.acquire();
@@ -110,6 +132,7 @@ static void test_live_cap_backpressure() {
 
     BlockRef denied = pool.acquire();
     CHECK(!denied.valid());                     // backpressure signal
+    CHECK(pool.live_blocks() == 3);
 
     r1.reset();                                 // free one slot
     CHECK(!pool.at_capacity());
@@ -118,37 +141,25 @@ static void test_live_cap_backpressure() {
     CHECK(pool.live_blocks() == 3);
 }
 
-static void test_warm_up() {
-    HeapBlockPool pool(/*block_size=*/1024, /*max_free_blocks=*/4);
-    CHECK(pool.free_blocks() == 0);
-
-    pool.warm_up(4);
-    CHECK(pool.free_blocks() == 4);             // parked, not checked out
-    CHECK(pool.live_blocks() == 0);
-
-    // A capped request is clamped to max_free_blocks, not overfilled.
-    pool.warm_up(100);
-    CHECK(pool.free_blocks() == 4);
-
-    // acquire() now pulls from the warmed free list instead of minting fresh
-    // storage; four in a row must not touch the (already-exhausted) free list.
-    BlockRef a = pool.acquire();
-    BlockRef b = pool.acquire();
-    BlockRef c = pool.acquire();
-    BlockRef d = pool.acquire();
-    CHECK(a.valid() && b.valid() && c.valid() && d.valid());
-    CHECK(pool.free_blocks() == 0);
-    CHECK(pool.live_blocks() == 4);
-
-    // A fifth still works (falls back to `new`, exactly as an un-warmed pool
-    // would) — warm_up() only removes that fallback for the first `count`.
-    BlockRef e = pool.acquire();
-    CHECK(e.valid());
-    CHECK(pool.live_blocks() == 5);
+// A block may outlive the pool that handed it out (a received Message kept after
+// its Connection is gone): it refers only to the resource and the shared counter.
+static void test_block_outlives_pool() {
+    CountingResource res;
+    BlockRef kept;
+    {
+        MessageBlockPool pool(config(&res, 1024, /*max_live_blocks=*/2));
+        kept = pool.acquire();
+        kept.writable_data()[0] = std::byte{42};
+        kept.set_range(0, 1);
+    }
+    CHECK(kept.valid() && kept.bytes()[0] == std::byte{42});
+    kept.reset();
+    CHECK(res.outstanding() == 0);
 }
 
 static void test_chain_append_and_linearize() {
-    HeapBlockPool pool(/*block_size=*/64);
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 64, kCounted));
     BlockChain chain;
     CHECK(chain.empty());
 
@@ -171,7 +182,8 @@ static void test_chain_append_and_linearize() {
 }
 
 static void test_chain_consume_front() {
-    HeapBlockPool pool(/*block_size=*/64, /*max_free_blocks=*/8);
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 64, kCounted));
     BlockChain chain;
     chain.append(make_filled(pool, 64, 0));
     chain.append(make_filled(pool, 64, 64));
@@ -189,7 +201,6 @@ static void test_chain_consume_front() {
     CHECK(chain.size() == 82);
     CHECK(chain.block_count() == 2);
     CHECK(pool.live_blocks() == 2);
-    CHECK(pool.free_blocks() == 1);
 
     // Remaining bytes must be the original stream offset 110 onward.
     std::vector<std::byte> out(chain.size());
@@ -201,7 +212,7 @@ static void test_chain_consume_front() {
         CHECK(out[i] == static_cast<std::byte>(expected));
     }
 
-    // Consume the rest: chain empty, everything back in the pool.
+    // Consume the rest: chain empty, every block released.
     chain.consume_front(1000);
     CHECK(chain.empty());
     CHECK(chain.block_count() == 0);
@@ -209,7 +220,8 @@ static void test_chain_consume_front() {
 }
 
 static void test_chain_first_slice() {
-    HeapBlockPool pool(/*block_size=*/16, /*max_free_blocks=*/8);
+    CountingResource res;
+    MessageBlockPool pool(config(&res, 16, kCounted));
     BlockChain chain;
     chain.append(make_filled(pool, 16, 0));      // stream [0,16)
     chain.append(make_filled(pool, 16, 16));     // stream [16,32)
@@ -228,17 +240,15 @@ static void test_chain_first_slice() {
     for (std::size_t i = 0; i < 24; ++i)
         CHECK(out[i] == static_cast<std::byte>(static_cast<std::uint8_t>(i)));
 
-    // Now consume the same 24 bytes from the source; block 0 returns to the pool
-    // but block 1 stays live because the slice still references it.
+    // Now consume the same 24 bytes from the source; block 0 is released by the
+    // source but stays live because the slice still references it.
     chain.consume_front(24);
     CHECK(chain.size() == 24);
     CHECK(pool.live_blocks() == 3);
-    CHECK(pool.free_blocks() == 0);
 
     // Dropping the slice releases block 0 (its only remaining ref).
     slice = BlockChain{};
     CHECK(pool.live_blocks() == 2);
-    CHECK(pool.free_blocks() == 1);
 
     // first() clamps to size().
     BlockChain all = chain.first(1000);
@@ -247,11 +257,10 @@ static void test_chain_first_slice() {
 
 int main() {
     test_pool_acquire_release();
-    test_pool_recycles_same_storage();
+    test_recycling_by_pool_resource();
     test_blockref_shared_ownership();
-    test_free_list_cap();
     test_live_cap_backpressure();
-    test_warm_up();
+    test_block_outlives_pool();
     test_chain_append_and_linearize();
     test_chain_consume_front();
     test_chain_first_slice();

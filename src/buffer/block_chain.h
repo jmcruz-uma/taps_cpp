@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <memory_resource>
 #include <span>
 
 namespace taps {
@@ -18,7 +19,7 @@ namespace taps {
 //
 // Data is appended at the back as it arrives (HandleReceivedData); consume_front()
 // advances a read cursor from the front (AdvanceReceiveCursor), releasing blocks
-// back to their pool as they are fully consumed. append() and consume_front() copy
+// back to the resource as they are fully consumed. append() and consume_front() copy
 // no payload bytes; only copy_to() does.
 class BlockChain {
 public:
@@ -31,14 +32,12 @@ public:
     std::size_t size()        const noexcept { return size_; }            // live bytes
     std::size_t block_count() const noexcept { return blocks_.size(); }
 
-    // The pool the chain's blocks were minted by, or nullptr for an empty chain.
-    // Every block in one chain is assumed to share the same pool (true by
-    // construction: a chain is built from one Connection's one pool's acquire()
-    // calls). Used by Message::ensure_gathered() to route the final gather
-    // allocation through the same strategy's hook (BlockPool::allocate_contiguous)
-    // instead of an unconditional global `new`.
-    BlockPool* pool() const noexcept {
-        return blocks_.empty() ? nullptr : blocks_.front().block()->pool();
+    // The message memory resource of the chain's blocks, or nullptr for an empty
+    // chain. All blocks of a chain come from one Connection's pool, hence one
+    // resource. Used for message memory derived from the chain (a Message's
+    // contiguous as_bytes() buffer).
+    std::pmr::memory_resource* resource() const noexcept {
+        return blocks_.empty() ? nullptr : blocks_.front().block()->resource();
     }
 
     // Iteration over the constituent BlockRefs, front to back.
@@ -46,7 +45,7 @@ public:
     auto end()   const noexcept { return blocks_.end(); }
 
     // Advances the read cursor by `n` bytes from the front (clamped to size()).
-    // Fully-consumed blocks are dropped and released to their pool; a straddled
+    // Fully-consumed blocks are dropped and released; a straddled
     // block has its begin advanced in place.
     void consume_front(std::size_t n);
 

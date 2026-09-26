@@ -16,7 +16,7 @@
 
 namespace taps {
 
-class BlockPool;
+class MessageBlockPool;
 
 // ============================================================================
 // UDPDemux (private)
@@ -41,7 +41,7 @@ class BlockPool;
 // ============================================================================
 class UDPDemux : public std::enable_shared_from_this<UDPDemux> {
 public:
-    UDPDemux(asio::io_context& ctx, std::unique_ptr<BlockPool> pool);
+    UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool);
     ~UDPDemux();
 
     // Binds the socket and starts the receive loop and the idle sweep.
@@ -75,7 +75,7 @@ private:
 
     asio::ip::udp::socket socket_;
     asio::strand<asio::io_context::executor_type> strand_;
-    std::unique_ptr<BlockPool> pool_;          // one block per datagram
+    std::unique_ptr<MessageBlockPool> pool_;   // one block per datagram
     asio::steady_timer sweep_timer_;
     asio::experimental::channel<void(std::error_code, std::unique_ptr<PassiveUDPConnection>)>
         accept_channel_;

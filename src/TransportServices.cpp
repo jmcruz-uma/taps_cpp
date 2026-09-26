@@ -1,24 +1,27 @@
 #include "taps/taps_api.h"
-#include "buffer/heap_block_pool.h"
+
+#include <memory_resource>
 
 namespace taps{
 
-// The only BlockPoolFactory shipped today: builds today's default HeapBlockPool.
-// Used whenever the app constructs a TransportServices without one of its own.
-namespace {
-class DefaultBlockPoolFactory : public BlockPoolFactory {
-public:
-    std::unique_ptr<BlockPool> make() const override {
-        return std::make_unique<HeapBlockPool>();
-    }
-};
-}  // namespace
+std::pmr::pool_options message_pool_options() noexcept {
+    std::pmr::pool_options options;
+    options.max_blocks_per_chunk = 16;
+    options.largest_required_pool_block = 64 * 1024;
+    return options;
+}
 
-TransportServices::TransportServices(asio::io_context& ctx,
-                                     std::shared_ptr<BlockPoolFactory> pool_factory)
-    : io_context_(ctx),
-      pool_factory_(pool_factory ? std::move(pool_factory)
-                                  : std::make_shared<DefaultBlockPoolFactory>()) {}
+std::pmr::memory_resource* default_message_resource() {
+    static std::pmr::unsynchronized_pool_resource resource(message_pool_options(),
+                                                           std::pmr::new_delete_resource());
+    return &resource;
+}
+
+TransportServices::TransportServices(asio::io_context& ctx, MessageMemoryConfig memory)
+    : io_context_(ctx), memory_(memory) {
+    if (!memory_.resource)
+        memory_.resource = default_message_resource();
+}
 
 // ============================================================================
 // TransportServices Implementation
@@ -33,7 +36,7 @@ asio::awaitable<Result<std::unique_ptr<Listener>>> TransportServices::listen(
         try {
             auto listener = std::make_unique<TCPListener>(io_context_, std::move(local),
                                                          std::move(properties), std::move(security),
-                                                         pool_factory_);
+                                                         memory_);
             auto listen_result = co_await listener->listen();
             if (!listen_result) {
                 co_return std::unexpected(listen_result.error());
@@ -47,7 +50,7 @@ asio::awaitable<Result<std::unique_ptr<Listener>>> TransportServices::listen(
         try {
             auto listener = std::make_unique<UDPListener>(io_context_, std::move(local),
                                                          std::move(properties), std::move(security),
-                                                         pool_factory_);
+                                                         memory_);
             auto listen_result = co_await listener->listen();
             if (!listen_result) {
                 co_return std::unexpected(listen_result.error());

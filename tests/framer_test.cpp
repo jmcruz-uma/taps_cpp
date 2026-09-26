@@ -5,8 +5,7 @@
 #include "taps/taps_api.h"
 
 #include "buffer/block_chain.h"
-#include "buffer/block_pool.h"
-#include "buffer/heap_block_pool.h"
+#include "buffer/message_block_pool.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -16,6 +15,15 @@
 #include <vector>
 
 using namespace taps;
+
+// Blocks of `block_size` bytes from the default message resource. The large cap
+// only makes live_blocks() count them.
+static MessageBlockPool test_pool(std::size_t block_size) {
+    MessageMemoryConfig c;
+    c.block_size = block_size;
+    c.max_live_blocks = 1000;
+    return MessageBlockPool(c);
+}
 
 static int g_failures = 0;
 
@@ -28,7 +36,7 @@ static int g_failures = 0;
     } while (0)
 
 // Split `bytes` into `block`-sized links of a fresh chain.
-static void fill_chain(BlockChain& chain, BlockPool& pool,
+static void fill_chain(BlockChain& chain, MessageBlockPool& pool,
                        std::span<const std::byte> bytes, std::size_t block) {
     std::size_t off = 0;
     while (off < bytes.size()) {
@@ -55,7 +63,7 @@ static std::vector<std::byte> record(std::uint32_t len, std::uint8_t body_seed) 
 }
 
 static void test_cursor_copy_out_across_blocks() {
-    HeapBlockPool pool(/*block_size=*/4);
+    MessageBlockPool pool = test_pool(4);
     std::vector<std::byte> data;
     for (int i = 0; i < 20; ++i) data.push_back(std::byte(static_cast<std::uint8_t>(i)));
     BlockChain chain;
@@ -72,7 +80,7 @@ static void test_cursor_copy_out_across_blocks() {
 }
 
 static void test_cursor_try_contiguous() {
-    HeapBlockPool pool(/*block_size=*/8);
+    MessageBlockPool pool = test_pool(8);
     std::vector<std::byte> data(24);
     for (std::size_t i = 0; i < data.size(); ++i) data[i] = std::byte(static_cast<std::uint8_t>(i));
     BlockChain chain;
@@ -93,7 +101,7 @@ static void test_cursor_try_contiguous() {
 }
 
 static void test_lpf_parse_need_more() {
-    HeapBlockPool pool(64);
+    MessageBlockPool pool = test_pool(64);
     LengthPrefixedFramer f;  // 4-byte big-endian
 
     {   // empty
@@ -120,7 +128,7 @@ static void test_lpf_parse_need_more() {
 }
 
 static void test_lpf_parse_emit_and_second_record() {
-    HeapBlockPool pool(/*block_size=*/3);   // tiny: prefixes and bodies straddle blocks
+    MessageBlockPool pool = test_pool(3);   // tiny: prefixes and bodies straddle blocks
     LengthPrefixedFramer f;
 
     auto r1 = record(10, 0);
@@ -173,7 +181,7 @@ static void test_lpf_write_header_roundtrip() {
     CHECK(std::to_integer<int>(h[3]) == 0x00);
 
     // header written by write_header parses back to the same length
-    HeapBlockPool pool(64);
+    MessageBlockPool pool = test_pool(64);
     std::vector<std::byte> framed(h, h + 4);
     framed.resize(4 + 513);
     BlockChain c; fill_chain(c, pool, framed, 64);
@@ -183,7 +191,7 @@ static void test_lpf_write_header_roundtrip() {
 }
 
 static void test_passthrough() {
-    HeapBlockPool pool(/*block_size=*/16);
+    MessageBlockPool pool = test_pool(16);
     std::vector<std::byte> raw;         // no framing header for passthrough
     for (int i = 0; i < 50; ++i) raw.push_back(std::byte(static_cast<std::uint8_t>(i)));
     BlockChain chain;

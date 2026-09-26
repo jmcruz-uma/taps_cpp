@@ -2,8 +2,7 @@
 #include "taps/mailbox.h"
 #include "taps/message_framer.h"
 #include "buffer/block_chain.h"
-#include "buffer/block_pool.h"
-#include "buffer/heap_block_pool.h"
+#include "buffer/message_block_pool.h"
 #include "transport/io_error.h"
 #include "udp_demux.h"
 #include <asio/co_spawn.hpp>
@@ -158,9 +157,9 @@ std::size_t PassiveUDPConnection::datagrams_dropped() const noexcept {
 // ============================================================================
 
 ActiveUDPConnection::ActiveUDPConnection(asio::io_context& ctx, asio::ip::udp::endpoint endpoint,
-                                         std::shared_ptr<BlockPoolFactory> pool_factory)
+                                         const MessageMemoryConfig& memory)
     : socket_(ctx), remote_endpoint_(endpoint),
-      block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()) {
+      block_pool_(std::make_unique<MessageBlockPool>(memory)) {
     state_ = ConnectionState::ESTABLISHING;
 }
 
@@ -223,6 +222,9 @@ asio::awaitable<Result<Message>> ActiveUDPConnection::receive() {
         // Read straight into a pooled block; deliver the datagram as a
         // single-block chain, recycled when the Message is dropped. No copy.
         BlockRef block = block_pool_->acquire();
+        if (!block)
+            co_return std::unexpected(TAPSError(ErrorEvent::RECEIVE_ERROR, ErrorReason::RESOURCE_EXHAUSTED,
+                                                "receive block pool exhausted"));
         asio::ip::udp::endpoint sender_endpoint;
 
         const std::size_t n = co_await socket_.async_receive_from(

@@ -7,8 +7,7 @@
 #include "taps/taps_api.h"
 
 #include "buffer/block_chain.h"
-#include "buffer/block_pool.h"
-#include "buffer/heap_block_pool.h"
+#include "buffer/message_block_pool.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,6 +19,15 @@
 #include <vector>
 
 using namespace taps;
+
+// Blocks of `block_size` bytes from the default message resource. The large cap
+// only makes live_blocks() count them.
+static MessageBlockPool test_pool(std::size_t block_size) {
+    MessageMemoryConfig c;
+    c.block_size = block_size;
+    c.max_live_blocks = 1000;
+    return MessageBlockPool(c);
+}
 
 static int g_failures = 0;
 
@@ -36,7 +44,7 @@ static bool bytes_equal(std::span<const std::byte> b, const std::string& s) {
 }
 
 // Builds a chain holding a copy of `s` split into `block`-sized links.
-static std::shared_ptr<BlockChain> make_chain(BlockPool& pool, const std::string& s,
+static std::shared_ptr<BlockChain> make_chain(MessageBlockPool& pool, const std::string& s,
                                               std::size_t block) {
     auto chain = std::make_shared<BlockChain>();
     std::size_t off = 0;
@@ -86,7 +94,7 @@ static void test_span_variant() {
 }
 
 static void test_chain_as_bytes() {
-    HeapBlockPool pool(/*block_size=*/16);
+    MessageBlockPool pool = test_pool(16);
     const std::string s = "the quick brown fox jumps over the lazy dog, twice.";
     auto chain = make_chain(pool, s, 16);
     CHECK(chain->block_count() >= 3);
@@ -105,7 +113,7 @@ static void test_chain_as_bytes() {
 }
 
 static void test_chain_blocks_zero_copy() {
-    HeapBlockPool pool(/*block_size=*/16);
+    MessageBlockPool pool = test_pool(16);
     const std::string s(70, '\0');
     std::string filled = s;
     for (std::size_t i = 0; i < filled.size(); ++i)
@@ -128,7 +136,7 @@ static void test_chain_blocks_zero_copy() {
 }
 
 static void test_chain_single_block_no_copy() {
-    HeapBlockPool pool(/*block_size=*/64);
+    MessageBlockPool pool = test_pool(64);
     const std::string s = "fits in one block";
     auto chain = make_chain(pool, s, 64);
     CHECK(chain->block_count() == 1);
@@ -142,7 +150,7 @@ static void test_chain_single_block_no_copy() {
 }
 
 static void test_free_copy() {
-    HeapBlockPool pool(/*block_size=*/8);
+    MessageBlockPool pool = test_pool(8);
     const std::string s = "assemble me into a caller buffer";
     auto chain = make_chain(pool, s, 8);
     Message chained(chain);
@@ -161,7 +169,7 @@ static void test_free_copy() {
 }
 
 static void test_chain_partial() {
-    HeapBlockPool pool(/*block_size=*/32);
+    MessageBlockPool pool = test_pool(32);
     const std::string s = "fragment without end";
     auto chain = make_chain(pool, s, 32);
 
@@ -173,7 +181,7 @@ static void test_chain_partial() {
 }
 
 static void test_chain_blocks_released_with_message() {
-    HeapBlockPool pool(/*block_size=*/16);
+    MessageBlockPool pool = test_pool(16);
     const std::string s(200, 'x');
     CHECK(pool.live_blocks() == 0);
     {

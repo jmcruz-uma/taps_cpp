@@ -3,8 +3,7 @@
 #include "taps/message_framer.h"
 #include "buffer/block.h"
 #include "buffer/block_chain.h"
-#include "buffer/block_pool.h"
-#include "buffer/heap_block_pool.h"
+#include "buffer/message_block_pool.h"
 #include "transport/plain_stream.h"
 #include "transport/io_error.h"
 #include "security/security_provider.h"
@@ -30,10 +29,10 @@ namespace taps {
 // ============================================================================
 
     TCPConnection::TCPConnection(asio::io_context& ctx, asio::ip::tcp::endpoint endpoint,
-                                 std::shared_ptr<BlockPoolFactory> pool_factory)
+                                 const MessageMemoryConfig& memory)
         : socket_(ctx),
           stream_(std::make_unique<PlainStream>(socket_)),
-          block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()),
+          block_pool_(std::make_unique<MessageBlockPool>(memory)),
           receive_chain_(std::make_unique<BlockChain>()),
           current_block_(std::make_unique<BlockRef>()){
             remote_endpoint_ = endpoint;
@@ -41,10 +40,10 @@ namespace taps {
 
     // Constructor for accepted connections
     TCPConnection::TCPConnection(asio::ip::tcp::socket socket,
-                                 std::shared_ptr<BlockPoolFactory> pool_factory)
+                                 const MessageMemoryConfig& memory)
         : socket_(std::move(socket)),
           stream_(std::make_unique<PlainStream>(socket_)),
-          block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()),
+          block_pool_(std::make_unique<MessageBlockPool>(memory)),
           receive_chain_(std::make_unique<BlockChain>()),
           current_block_(std::make_unique<BlockRef>()) {
         state_ = ConnectionState::ESTABLISHED;
@@ -60,7 +59,7 @@ namespace taps {
         }
     }
 
-    // Out-of-line so ~unique_ptr<BlockPool> is instantiated where BlockPool is complete.
+    // Out-of-line so ~unique_ptr<MessageBlockPool> is instantiated where it is complete.
     TCPConnection::~TCPConnection() = default;
 
     asio::awaitable<Result<void>> TCPConnection::send(const Message& message) {
