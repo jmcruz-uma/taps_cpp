@@ -9,6 +9,7 @@
 #include <asio/experimental/channel.hpp>
 
 #include "taps/message_framer.h"   // taps::MessageFramer (API v2), ReceiveCursor, ParseResult
+#include "taps/mailbox.h"          // Mailbox::CloseCause (UDPListener::evict)
 
 #include <string>
 #include <vector>
@@ -50,28 +51,50 @@ class Mailbox;
 // Error Handling
 // ============================================================================
 
-enum class ErrorType {
-    CONNECTION_FAILED,
-    CONNECTION_REFUSED,
-    CONNECTION_TIMEOUT,
-    INTERNAL_ERROR,
-    INSUFFICIENT_DATA,
-    INVALID_CONFIGURATION,
-    RESOLUTION_FAILED,
-    FRAMING_ERROR,
-    PROTOCOL_ERROR
+// An error is reported as an RFC 9622 event plus a reason. The event says what
+// failed and whether the Connection survives: SEND_ERROR and RECEIVE_ERROR leave
+// it usable; CONNECTION_ERROR means it has ended (state CLOSED).
+enum class ErrorEvent {
+    ESTABLISHMENT_ERROR,   // RFC 9622 Sections 7.1 and 7.2 (Connection or Listener)
+    SEND_ERROR,            // RFC 9622 Section 9.2.2.3
+    RECEIVE_ERROR,         // RFC 9622 Section 9.3.2.3
+    CONNECTION_ERROR       // RFC 9622 Section 10
+};
+
+// Reasons from RFC 9623 Appendix B, followed by those this implementation adds
+// where the Appendix has no name.
+enum class ErrorReason {
+    INVALID_CONFIGURATION,  // Properties or Endpoints contradictory or incomplete
+    NO_CANDIDATES,          // valid configuration, no available protocol satisfies it
+    RESOLUTION_FAILED,      // an Endpoint could not be resolved
+    ESTABLISHMENT_FAILED,   // no transport-layer connection to the Remote Endpoint
+    POLICY_PROHIBITED,      // the system forbids the action
+    MESSAGE_TOO_LARGE,      // the Message is too big to handle
+    PROTOCOL_FAILED,        // the underlying Protocol Stack failed
+    DEFRAMING_FAILED,       // received data could not be processed by the Message Framer
+    CONNECTION_ABORTED,     // the peer aborted the connection
+    TIMEOUT,                // delivery was not possible after a timeout
+
+    LOCAL_ABORT,                 // the application called abort() (RFC 9622 Section 10)
+    LOCAL_ENDPOINT_UNAVAILABLE,  // the Local Endpoint is in use on this system
+    INVALID_STATE,               // the operation is not valid in the current state
+    RESOURCE_EXHAUSTED,          // memory or descriptors for the operation ran out
+    IDLE_TIMEOUT,                // the Connection was ended after staying idle
+    INTERNAL_ERROR               // unexpected failure inside the implementation
 };
 
 class TAPSError {
 public:
-    TAPSError(ErrorType type, std::string message) 
-        : type_(type), message_(std::move(message)) {}
-    
-    ErrorType type() const noexcept { return type_; }
+    TAPSError(ErrorEvent event, ErrorReason reason, std::string message)
+        : event_(event), reason_(reason), message_(std::move(message)) {}
+
+    ErrorEvent event() const noexcept { return event_; }
+    ErrorReason reason() const noexcept { return reason_; }
     const std::string& message() const noexcept { return message_; }
 
 private:
-    ErrorType type_;
+    ErrorEvent event_;
+    ErrorReason reason_;
     std::string message_;
 };
 
@@ -443,12 +466,14 @@ private:
 // Connection States
 // ============================================================================
 
+// RFC 9622 Section 11. A Connection that ends because of an error goes to CLOSED;
+// the error itself is reported by the CONNECTION_ERROR (or ESTABLISHMENT_ERROR)
+// returned by the operation that observed it.
 enum class ConnectionState {
     ESTABLISHING,
     ESTABLISHED,
     CLOSING,
-    CLOSED,
-    ERROR
+    CLOSED
 };
 
 // ============================================================================
@@ -635,6 +660,11 @@ private:
     // Bytes received but not yet parsed by the framer, behind the receive cursor.
     std::unique_ptr<BlockChain> receive_chain_;
     bool receive_eof_ = false;
+    // The last Message delivered had endOfMessage = false: a later end of stream
+    // leaves that Message incomplete.
+    bool message_open_ = false;
+    // abort() was called: cancelled operations report LOCAL_ABORT.
+    bool aborted_ = false;
     // The block read_one_chunk() is currently filling; may be invalid (no block
     // checked out). Kept across calls so a small read doesn't strand the rest of
     // a block's capacity — see read_one_chunk().
@@ -642,6 +672,9 @@ private:
 
     asio::awaitable<Result<Message>> receive_with_framing();
     asio::awaitable<Result<Message>> receive_without_framing();
+
+    // Classifies a receive-path failure and applies its effect on state_.
+    TAPSError receive_failure(TAPSError error);
 
     // Reads the next chunk of the byte-stream into a pooled block, reusing
     // current_block_'s leftover capacity across calls instead of checking out a
@@ -683,6 +716,7 @@ private:
 
     std::shared_ptr<Mailbox> mailbox_;
     std::function<void()> on_close_;
+    bool aborted_ = false;
 };
 
 class ActiveUDPConnection : public Connection {
@@ -705,6 +739,7 @@ private:
     asio::ip::udp::endpoint remote_endpoint_;
     // Fixed-size blocks for the receive path; one datagram per block, no copy.
     std::unique_ptr<BlockPool> block_pool_;
+    bool aborted_ = false;
 };
 
 class TCPListener : public Listener {
@@ -771,7 +806,7 @@ private:
     // Demux helpers, all run on strand_.
     std::shared_ptr<Mailbox> touch_or_create(const asio::ip::udp::endpoint& sender,
                                              bool& is_new);
-    void evict(std::list<Conn>::iterator it);
+    void evict(std::list<Conn>::iterator it, Mailbox::CloseCause cause);
     asio::awaitable<void> sweep_loop();
 };
 

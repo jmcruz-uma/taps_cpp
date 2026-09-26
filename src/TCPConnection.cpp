@@ -6,6 +6,7 @@
 #include "buffer/block_pool.h"
 #include "buffer/heap_block_pool.h"
 #include "transport/plain_stream.h"
+#include "transport/io_error.h"
 #include "security/security_provider.h"
 #include <asio/use_awaitable.hpp>
 #include <asio/redirect_error.hpp>
@@ -19,6 +20,7 @@
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace taps {
@@ -63,8 +65,8 @@ namespace taps {
 
     asio::awaitable<Result<void>> TCPConnection::send(const Message& message) {
         if (state_ != ConnectionState::ESTABLISHED) {
-            co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, 
-                                              "Connection not established"));
+            co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::INVALID_STATE,
+                                                "Connection not established"));
         }
         
         // Build the buffer sequence, then hand it to the stream (PlainStream today,
@@ -99,7 +101,10 @@ namespace taps {
 
         auto w = co_await stream_->write(iov);
         if (!w) {
-            state_ = ConnectionState::ERROR;
+            if (w.error().reason() == ErrorReason::LOCAL_ABORT && !aborted_)
+                co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::INVALID_STATE,
+                                                    "Connection closed locally"));
+            state_ = ConnectionState::CLOSED;
             co_return std::unexpected(w.error());
         }
         co_return std::expected<void, TAPSError>{std::in_place};
@@ -107,8 +112,9 @@ namespace taps {
     
     asio::awaitable<Result<Message>> TCPConnection::receive() {
         if (state_ != ConnectionState::ESTABLISHED) {
-            co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, 
-                                              "Connection not established"));
+            co_return std::unexpected(TAPSError(
+                ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE,
+                receive_eof_ ? "the stream has ended: no more Messages" : "Connection not established"));
         }
         
         try {
@@ -119,9 +125,9 @@ namespace taps {
             }
             
         } catch (const std::system_error& e) {
-            state_ = ConnectionState::ERROR;
-            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, 
-                                              e.code().message()});
+            state_ = ConnectionState::CLOSED;
+            co_return std::unexpected(TAPSError{ErrorEvent::CONNECTION_ERROR, ErrorReason::INTERNAL_ERROR,
+                                                e.code().message()});
         }
     }
     
@@ -135,34 +141,27 @@ namespace taps {
         // Graceful shutdown of the write direction (TCP FIN / TLS close_notify),
         // then hard-close the socket.
         auto sd = co_await stream_->shutdown();
-        if (!sd) {
-            state_ = ConnectionState::ERROR;
+        asio::error_code ec;
+        socket_.close(ec);
+        state_ = ConnectionState::CLOSED;
+        if (!sd)
             co_return std::unexpected(sd.error());
-        }
-
-        try {
-            socket_.close();
-            state_ = ConnectionState::CLOSED;
-            co_return std::expected<void, TAPSError>{std::in_place};
-
-        } catch (const std::system_error& e) {
-            state_ = ConnectionState::ERROR;
-            co_return std::unexpected(TAPSError{ErrorType::INTERNAL_ERROR,
-                                              e.code().message()});
-        }
+        if (ec)
+            co_return std::unexpected(TAPSError{ErrorEvent::CONNECTION_ERROR, ErrorReason::INTERNAL_ERROR,
+                                                ec.message()});
+        co_return std::expected<void, TAPSError>{std::in_place};
     }
     
+    // Pending operations complete with CONNECTION_ERROR / LOCAL_ABORT.
     asio::awaitable<Result<void>> TCPConnection::abort(){
-        try {
-            socket_.close();
-            state_ = ConnectionState::CLOSED;
-            co_return std::expected<void, TAPSError>{std::in_place};
-            
-        } catch (const std::system_error& e) {
-            state_ = ConnectionState::ERROR;
-            co_return std::unexpected(TAPSError{ErrorType::INTERNAL_ERROR, 
-                                              e.code().message()});
-        }
+        aborted_ = true;
+        asio::error_code ec;
+        socket_.close(ec);
+        state_ = ConnectionState::CLOSED;
+        if (ec)
+            co_return std::unexpected(TAPSError{ErrorEvent::CONNECTION_ERROR, ErrorReason::INTERNAL_ERROR,
+                                                ec.message()});
+        co_return std::expected<void, TAPSError>{std::in_place};
     }
     
     RemoteEndpoint TCPConnection::get_remote_endpoint() const{
@@ -186,7 +185,7 @@ namespace taps {
         SecurityProvider& provider, std::string server_name) {
         auto secured = co_await provider.secure(socket_, std::move(server_name));
         if (!secured) {
-            state_ = ConnectionState::ERROR;
+            state_ = ConnectionState::CLOSED;
             co_return std::unexpected(secured.error());
         }
         stream_ = std::move(*secured);   // the plain PlainStream is dropped here
@@ -202,8 +201,8 @@ namespace taps {
     // Method to establish connection (called by Preconnection)
     asio::awaitable<Result<void>> TCPConnection::connect() {
         if (state_ != ConnectionState::ESTABLISHING) {
-            co_return std::unexpected(TAPSError{ErrorType::INVALID_CONFIGURATION, 
-                                              "Connection not in establishing state"});
+            co_return std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INVALID_STATE,
+                                                "Connection not in establishing state"});
         }
         
         try {
@@ -217,9 +216,9 @@ namespace taps {
             co_return std::expected<void, TAPSError>{std::in_place};
             
         } catch (const std::system_error& e) {
-            state_ = ConnectionState::ERROR;
-            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, 
-                                              e.code().message()});
+            state_ = ConnectionState::CLOSED;
+            co_return std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR,
+                                                ErrorReason::ESTABLISHMENT_FAILED, e.code().message()});
         }
     }
 
@@ -237,7 +236,7 @@ namespace taps {
         if (!*current_block_ || current_block_->capacity_after_begin() < reuse_threshold) {
             *current_block_ = block_pool_->acquire();
             if (!*current_block_) {
-                co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED,
+                co_return std::unexpected(TAPSError{ErrorEvent::RECEIVE_ERROR, ErrorReason::RESOURCE_EXHAUSTED,
                                                     "receive block pool exhausted"});
             }
         }
@@ -245,6 +244,8 @@ namespace taps {
         auto r = co_await stream_->read_some(
             asio::buffer(current_block_->writable_data(), current_block_->capacity_after_begin()));
         if (!r) {
+            if (r.error().event() == ErrorEvent::RECEIVE_ERROR)
+                receive_eof_ = true;   // the stream ended, though not cleanly
             co_return std::unexpected(r.error());
         }
         const std::size_t n = *r;
@@ -272,12 +273,20 @@ namespace taps {
             ParseResult pr = framer_->parse(ReceiveCursor(*receive_chain_), receive_eof_);
 
             if (pr.action == ParseResult::Action::Emit) {
+                const std::size_t consumed = pr.discard_before + pr.deliver;
+                if (consumed == 0 || consumed > receive_chain_->size()) {
+                    co_return std::unexpected(receive_failure(TAPSError{
+                        ErrorEvent::RECEIVE_ERROR, ErrorReason::DEFRAMING_FAILED,
+                        consumed == 0 ? "Message Framer emitted a record that consumes no data"
+                                      : "Message Framer emitted a record beyond the received data"}));
+                }
                 if (pr.discard_before > 0)
                     receive_chain_->consume_front(pr.discard_before);
 
                 // The record is a refcounted slice of the chain — no payload copy.
                 auto slice = std::make_shared<BlockChain>(receive_chain_->first(pr.deliver));
                 receive_chain_->consume_front(pr.deliver);
+                message_open_ = !pr.end_of_message;
                 Message m(std::move(slice), MessageContext{}, pr.end_of_message);
                 if (pr.gather)
                     (void)m.as_bytes();   // gather now, here, not on first app access
@@ -286,16 +295,28 @@ namespace taps {
 
             // ParseResult::Action::NeedMore
             if (receive_eof_) {
+                // RFC 9623 Section 5.2 / RFC 9622 Section 9.3.2.3: a stream that ends
+                // inside a Message, or with bytes the framer cannot parse, is a
+                // ReceiveError, not a clean end.
+                const std::size_t unparsed = receive_chain_->size();
+                if (message_open_ || unparsed > 0) {
+                    const std::string what = message_open_
+                        ? "stream ended before the end of the Message"
+                        : "stream ended with " + std::to_string(unparsed) +
+                          " bytes the Message Framer could not parse";
+                    receive_chain_->consume_front(unparsed);
+                    message_open_ = false;
+                    co_return std::unexpected(receive_failure(TAPSError{
+                        ErrorEvent::RECEIVE_ERROR, ErrorReason::DEFRAMING_FAILED, what}));
+                }
                 state_ = ConnectionState::CLOSED;
                 co_return Message(std::make_shared<BlockChain>(), MessageContext{},
                                   /*end_of_message=*/true);
             }
 
             auto chunk = co_await read_one_chunk();
-            if (!chunk) {
-                state_ = ConnectionState::ERROR;
-                co_return std::unexpected(chunk.error());
-            }
+            if (!chunk)
+                co_return std::unexpected(receive_failure(chunk.error()));
             if (*chunk)
                 receive_chain_->append(std::move(*chunk));
             // Otherwise read_one_chunk() hit EOF (receive_eof_ is now set); loop
@@ -309,10 +330,8 @@ namespace taps {
         // chunk as it arrives, with is_end_of_message() bound to the peer's
         // half-close. No accumulation; memory stays bounded for any transfer size.
         auto chunk = co_await read_one_chunk();
-        if (!chunk) {
-            state_ = ConnectionState::ERROR;
-            co_return std::unexpected(chunk.error());
-        }
+        if (!chunk)
+            co_return std::unexpected(receive_failure(chunk.error()));
         if (!*chunk) {
             // Graceful close: final fragment, empty, endOfMessage = true.
             state_ = ConnectionState::CLOSED;
@@ -323,6 +342,19 @@ namespace taps {
         auto chain = std::make_shared<BlockChain>();
         chain->append(std::move(*chunk));
         co_return Message(std::move(chain), MessageContext{}, /*end_of_message=*/false);
+    }
+
+    // A pending read cancelled by close() is reported as INVALID_STATE (by abort(),
+    // it stays LOCAL_ABORT). The state follows the event: a CONNECTION_ERROR ends the
+    // Connection, and so does a RECEIVE_ERROR once the stream itself has ended, as
+    // a clean end does; any other RECEIVE_ERROR leaves it as it was.
+    TAPSError TCPConnection::receive_failure(TAPSError error) {
+        if (error.reason() == ErrorReason::LOCAL_ABORT && !aborted_)
+            error = TAPSError{ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE,
+                              "Connection closed locally"};
+        if (error.event() == ErrorEvent::CONNECTION_ERROR || receive_eof_)
+            state_ = ConnectionState::CLOSED;
+        return error;
     }
 
 

@@ -1,7 +1,8 @@
 // End-to-end TLS over the taps_cpp public API only: a taps_cpp listener with a
 // server certificate and a taps_cpp client with the pinned CA, exercising the
-// no-framer, framed and bulk paths over the encrypted stream, plus a negative
-// case (wrong trust anchor must be rejected). Certificates are generated into the
+// no-framer, framed and bulk paths over the encrypted stream, plus negative cases:
+// a wrong trust anchor is rejected without stopping the Listener, and a stream
+// truncated without close_notify ends in a ReceiveError. Certificates are generated into the
 // build directory by gen_test_certs.sh; TLS_TEST_CERT_DIR points at them.
 
 #include "taps/taps_api.h"
@@ -162,16 +163,16 @@ static asio::awaitable<void> truncation_client(asio::io_context& ctx, std::uint1
     if (!cr) { std::printf("FAIL  truncation: initiate: %s\n", cr.error().message().c_str()); ++g_failures; co_return; }
     auto& conn = *cr;
     std::size_t total = 0;
-    bool clean_end = false;
+    Result<Message> rr = std::unexpected(TAPSError{ErrorEvent::RECEIVE_ERROR, ErrorReason::INTERNAL_ERROR, ""});
     for (;;) {
-        auto rr = co_await conn->receive();
-        if (!rr) break;
-        auto m = std::move(*rr);
-        if (m.size() == 0) { clean_end = m.is_end_of_message(); break; }
-        total += m.size();
+        rr = co_await conn->receive();
+        if (!rr || rr->size() == 0) break;
+        total += rr->size();
     }
-    CHECK(total == DROP_BYTES && clean_end,
-          "peer closing without close_notify ends the stream like a clean close");
+    CHECK(total == DROP_BYTES && !rr && rr.error().event() == ErrorEvent::RECEIVE_ERROR &&
+              rr.error().reason() == ErrorReason::PROTOCOL_FAILED,
+          "peer closing without close_notify: the data, then RECEIVE_ERROR / PROTOCOL_FAILED");
+    CHECK(conn->state() == ConnectionState::CLOSED, "truncated TLS stream: connection is CLOSED");
 }
 
 // Client that pins the wrong anchor (the leaf itself) must fail the handshake.
@@ -180,7 +181,9 @@ static asio::awaitable<void> bad_anchor_client(asio::io_context& ctx, std::uint1
     auto pc = ts.preconnect(LocalEndpoint{}, RemoteEndpoint{"127.0.0.1", port},
                             tcp_props(), client_params(path("srv.crt")));
     auto cr = co_await pc.initiate();
-    CHECK(!cr, "wrong trust anchor is rejected");
+    CHECK(!cr && cr.error().event() == ErrorEvent::ESTABLISHMENT_ERROR &&
+              cr.error().reason() == ErrorReason::ESTABLISHMENT_FAILED,
+          "wrong trust anchor is rejected: ESTABLISHMENT_ERROR / ESTABLISHMENT_FAILED");
 }
 
 // Runs `setup` on a fresh io_context until it stops.
@@ -225,6 +228,9 @@ int main() {
             asio::steady_timer t(c, std::chrono::milliseconds(150));
             co_await t.async_wait(asio::use_awaitable);
             co_await bad_anchor_client(c, 19973);
+            // The failed handshake is not a Listener error: the same accept() goes
+            // on to deliver the next, valid connection.
+            co_await echo_client(c, 19973, false, "listener keeps accepting after a failed handshake");
             c.stop();
         }, asio::detached);
     });

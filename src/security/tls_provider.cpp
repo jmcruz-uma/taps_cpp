@@ -45,7 +45,8 @@ std::string alpn_wire(const std::vector<std::string>& ids) {
 using ProviderResult = Result<std::unique_ptr<TlsProvider>>;
 
 ProviderResult fail(std::string msg) {
-    return std::unexpected(TAPSError{ErrorType::INVALID_CONFIGURATION, std::move(msg)});
+    return std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR,
+                                     ErrorReason::INVALID_CONFIGURATION, std::move(msg)});
 }
 
 }  // namespace
@@ -163,7 +164,7 @@ TlsProvider::secure(asio::ip::tcp::socket& socket, std::string server_name) {
             }
             if (!ok) {
                 co_return std::unexpected(TAPSError{
-                    ErrorType::CONNECTION_FAILED,
+                    ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::ESTABLISHMENT_FAILED,
                     "ALPN mismatch: server selected '" + negotiated + "'"});
             }
         }

@@ -71,6 +71,13 @@ public:
     // Inspect the cursor and decide. `at_eof` becomes true once the peer has
     // half-closed. Returns Emit for exactly one record (the receive loop calls
     // parse() again after the cursor advances) or NeedMore to read more.
+    //  - An Emit must consume at least one byte (discard_before + deliver > 0) and
+    //    no more than the cursor holds; otherwise receive() fails with
+    //    DEFRAMING_FAILED.
+    //  - At EOF, NeedMore with an empty cursor is the clean end of the stream. If
+    //    bytes remain, or the last Message emitted had end_of_message = false,
+    //    receive() fails with DEFRAMING_FAILED. A framer may first emit the part of
+    //    an unfinished Message that arrived, with end_of_message = false.
     virtual ParseResult parse(const ReceiveCursor& cursor, bool at_eof) = 0;
 
     // Write the framing header for `msg` into `out` (sized >= max_header_size()).
@@ -101,8 +108,8 @@ private:
 
 // No framing: the connection's whole byte-stream in a direction is one Message,
 // bounded only by the peer's half-close (RFC 9622 Section 9.3.2.2; RFC 9623
-// Section 5.2, "Each Message ... corresponds to the entire stream of bytes in a
-// direction"). Installing this framer is how an application asks for the transfer
+// Section 5, "Each Message in this case corresponds to the entire stream of bytes
+// in a direction"). Installing this framer is how an application asks for the transfer
 // as a single Message.
 //
 // `gather` (default true): the receive path gathers the blocks into one contiguous
@@ -116,7 +123,7 @@ public:
     explicit PassthroughFramer(bool gather = true) : gather_(gather) {}
 
     ParseResult parse(const ReceiveCursor& cursor, bool at_eof) override {
-        if (!at_eof)
+        if (!at_eof || cursor.size() == 0)
             return ParseResult::need_more();
         ParseResult r = ParseResult::emit(cursor.size(), /*eom=*/true);
         r.gather = gather_;

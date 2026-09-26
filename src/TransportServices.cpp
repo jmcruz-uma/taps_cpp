@@ -40,7 +40,7 @@ asio::awaitable<Result<std::unique_ptr<Listener>>> TransportServices::listen(
             }
             co_return std::unique_ptr<Listener>(std::move(listener));
         } catch (const std::exception& e) {
-            co_return std::unexpected(TAPSError(ErrorType::INTERNAL_ERROR, e.what()));
+            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
         }
     } else {
         // UDP Listener
@@ -54,7 +54,7 @@ asio::awaitable<Result<std::unique_ptr<Listener>>> TransportServices::listen(
             }
             co_return std::unique_ptr<Listener>(std::move(listener));
         } catch (const std::exception& e) {
-            co_return std::unexpected(TAPSError(ErrorType::INTERNAL_ERROR, e.what()));
+            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
         }
     }
 }

@@ -3,6 +3,7 @@
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
 #include "buffer/heap_block_pool.h"
+#include "transport/io_error.h"
 #include <asio/co_spawn.hpp>
 #include <asio/error.hpp>
 #include <asio/redirect_error.hpp>
@@ -88,7 +89,7 @@ UDPListener::touch_or_create(const asio::ip::udp::endpoint& sender, bool& is_new
     }
 
     if (index_.size() >= max_connections() && !lru_.empty())
-        evict(std::prev(lru_.end()));            // drop least-recently-active
+        evict(std::prev(lru_.end()), Mailbox::CloseCause::displaced);   // drop least-recently-active
 
     auto mailbox = std::make_shared<Mailbox>(strand_);
     lru_.push_front(Conn{sender, mailbox, now});
@@ -97,8 +98,8 @@ UDPListener::touch_or_create(const asio::ip::udp::endpoint& sender, bool& is_new
     return mailbox;
 }
 
-void UDPListener::evict(std::list<Conn>::iterator it) {
-    it->mailbox->close();                        // waiting receive() -> closed error
+void UDPListener::evict(std::list<Conn>::iterator it, Mailbox::CloseCause cause) {
+    it->mailbox->close(cause);                   // waiting receive() -> closed error
     index_.erase(it->endpoint);
     lru_.erase(it);
 }
@@ -112,7 +113,7 @@ asio::awaitable<void> UDPListener::sweep_loop() {
             co_return;                           // cancelled by stop()
         const auto cutoff = std::chrono::steady_clock::now() - idle_timeout();
         while (!lru_.empty() && lru_.back().last_active < cutoff)
-            evict(std::prev(lru_.end()));
+            evict(std::prev(lru_.end()), Mailbox::CloseCause::idle);
     }
 }
 
@@ -123,7 +124,7 @@ asio::awaitable<Result<void>> UDPListener::listen() {
         auto endpoints = co_await local_endpoint_.resolve(io_context_);
         if (endpoints.empty()) {
             co_return std::unexpected(
-                TAPSError(ErrorType::RESOLUTION_FAILED,
+                TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::RESOLUTION_FAILED,
                          "Failed to resolve local endpoint"));
         }
 
@@ -170,7 +171,7 @@ asio::awaitable<Result<void>> UDPListener::listen() {
                         conn->on_close_ = [this, sender] {
                             asio::post(strand_, [this, sender] {
                                 if (auto mit = index_.find(sender); mit != index_.end())
-                                    evict(mit->second);
+                                    evict(mit->second, Mailbox::CloseCause::owner);
                             });
                         };
 
@@ -179,7 +180,7 @@ asio::awaitable<Result<void>> UDPListener::listen() {
                         // reconnect once the app catches up).
                         if (!accept_channel_.try_send(std::error_code{}, std::move(conn))) {
                             if (auto mit = index_.find(sender); mit != index_.end())
-                                evict(mit->second);
+                                evict(mit->second, Mailbox::CloseCause::displaced);
                             continue;
                         }
                     }
@@ -193,16 +194,18 @@ asio::awaitable<Result<void>> UDPListener::listen() {
 
         co_return Result<void>{std::in_place};
 
+    } catch (const std::system_error& e) {
+        co_return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, e.code()));
     } catch (const std::exception& e) {
         co_return std::unexpected(
-            TAPSError(ErrorType::INTERNAL_ERROR, e.what()));
+            TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
     }
 }
 
 asio::awaitable<Result<std::unique_ptr<Connection>>> UDPListener::accept() {
     if (!is_listening_) {
         co_return std::unexpected(
-            TAPSError(ErrorType::INVALID_CONFIGURATION, "Not listening"));
+            TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INVALID_STATE, "Not listening"));
     }
 
     auto [ec, conn] =
@@ -210,7 +213,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> UDPListener::accept() {
 
     if (ec) {
         co_return std::unexpected(
-            TAPSError(ErrorType::INTERNAL_ERROR, ec.message()));
+            TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INVALID_STATE, "Listener stopped: " + ec.message()));
     }
     conn->state_ = ConnectionState::ESTABLISHED;
     co_return Result<std::unique_ptr<Connection>>(std::move(conn));

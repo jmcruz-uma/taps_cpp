@@ -45,7 +45,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
     auto asio_endpoints = co_await remote_endpoints_.at(0).resolve(io_context_);
 
     if (asio_endpoints.empty()) {
-        co_return std::unexpected(TAPSError(ErrorType::RESOLUTION_FAILED,
+        co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::RESOLUTION_FAILED,
                                           "Failed to resolve remote endpoint"));
     }
 
@@ -64,7 +64,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
 
             co_return co_await establish_connection(std::move(tcp_conn));
         } catch (const std::exception& e) {
-            co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, e.what()));
+            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
         }
     } else {
         // UDP: convert the resolved TCP endpoint to a UDP one.
@@ -75,7 +75,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
 
             co_return std::unique_ptr<Connection>(std::move(udp_conn));
         } catch (const std::exception& e) {
-            co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED, e.what()));
+            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
         }
     }
 }
@@ -98,12 +98,12 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::happy_eyebal
         }
 
         if (all_endpoints.empty()) {
-            co_return std::unexpected(TAPSError(ErrorType::RESOLUTION_FAILED,
+            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::RESOLUTION_FAILED,
                                               "No addresses resolved"));
         }
 
     } catch (const std::exception& e) {
-        co_return std::unexpected(TAPSError(ErrorType::RESOLUTION_FAILED, e.what()));
+        co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::RESOLUTION_FAILED, e.what()));
     }
 
     co_return co_await race_connections(all_endpoints);
@@ -132,11 +132,11 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::race_connect
     using namespace std::chrono_literals;
 
     if (endpoints.empty()) {
-        co_return std::unexpected(TAPSError(ErrorType::CONNECTION_FAILED,
+        co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::RESOLUTION_FAILED,
                                           "No endpoints to connect to"));
     }
 
-    TAPSError last_error{ErrorType::CONNECTION_FAILED, "No endpoints attempted"};
+    TAPSError last_error{ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::ESTABLISHMENT_FAILED, "No endpoints attempted"};
 
     for (std::size_t i = 0; i < endpoints.size(); ++i) {
         auto conn = std::make_unique<TCPConnection>(io_context_, endpoints[i], pool_factory_);
@@ -156,7 +156,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::race_connect
         }
     }
 
-    co_return std::unexpected(TAPSError(ErrorType::CONNECTION_TIMEOUT,
+    co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::ESTABLISHMENT_FAILED,
                                       "All " + std::to_string(endpoints.size()) +
                                       " connection attempts failed: " + last_error.message()));
 }
@@ -194,7 +194,7 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::establish_co
 #else
     co_await conn->abort();
     co_return std::unexpected(TAPSError{
-        ErrorType::INVALID_CONFIGURATION,
+        ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::NO_CANDIDATES,
         "SecurityParameters request TLS but this build has TAPS_WITH_TLS=OFF"});
 #endif
 }

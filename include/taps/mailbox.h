@@ -72,10 +72,22 @@ public:
         }
     }
 
-    void close() {
+    // Why the Mailbox was closed; a receive() waiting on it throws, and the owner
+    // reads the cause here.
+    enum class CloseCause {
+        owner,      // the connection was closed or aborted locally
+        idle,       // no traffic for longer than the listener's idle timeout
+        displaced   // evicted to make room for a new source (bounded table)
+    };
+
+    void close(CloseCause cause = CloseCause::owner) {
+        if (!closed_)
+            cause_ = cause;
         closed_ = true;
         timer_.cancel();
     }
+
+    CloseCause close_cause() const noexcept { return cause_; }
 
     std::size_t dropped() const noexcept {
         return dropped_.load(std::memory_order_relaxed);
@@ -88,6 +100,7 @@ private:
     std::size_t                capacity_;
     std::atomic<std::size_t>   dropped_{0};
     bool                       closed_ = false;
+    CloseCause                 cause_ = CloseCause::owner;
 };
 
 } // namespace taps

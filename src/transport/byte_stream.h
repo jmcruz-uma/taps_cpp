@@ -1,6 +1,6 @@
 #pragma once
 
-#include "taps/taps_api.h"   // Result, TAPSError, ErrorType
+#include "taps/taps_api.h"   // Result, TAPSError
 
 #include <asio/awaitable.hpp>
 #include <asio/buffer.hpp>
@@ -22,16 +22,19 @@ public:
     virtual ~ByteStream() = default;
 
     // Read up to buffer.size() bytes. Returns the count read; 0 means the peer
-    // half-closed the read side (EOF). A transport error is reported as unexpected.
+    // half-closed the read side (EOF). A stream that ends without its protocol's
+    // clean closure (TLS without close_notify) is a RECEIVE_ERROR: no more data
+    // will arrive, but what arrived may be incomplete. Any other failure is a
+    // CONNECTION_ERROR.
     virtual asio::awaitable<Result<std::size_t>> read_some(asio::mutable_buffer buffer) = 0;
 
     // Write every byte of every buffer (asio::async_write semantics). Returns the
-    // total number of bytes written.
+    // total number of bytes written. A failure is a CONNECTION_ERROR.
     virtual asio::awaitable<Result<std::size_t>> write(
         std::span<const asio::const_buffer> buffers) = 0;
 
     // Graceful shutdown of the write direction: a TCP FIN for a PlainStream, a TLS
-    // close_notify for a TlsStream.
+    // close_notify for a TlsStream. A failure is a CONNECTION_ERROR.
     virtual asio::awaitable<Result<void>> shutdown() = 0;
 
     // The negotiated TLS parameters, for diagnostics only (see SecurityInfo). A

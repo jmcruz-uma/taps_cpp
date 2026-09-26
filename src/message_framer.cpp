@@ -142,7 +142,7 @@ LengthPrefixedFramer::LengthPrefixedFramer(std::size_t length_field_size,
     : length_field_size_(std::clamp<std::size_t>(length_field_size, 1, 8)),
       byte_order_(byte_order) {}
 
-ParseResult LengthPrefixedFramer::parse(const ReceiveCursor& cursor, bool /*at_eof*/) {
+ParseResult LengthPrefixedFramer::parse(const ReceiveCursor& cursor, bool at_eof) {
     const std::size_t avail = cursor.size();
     if (avail < length_field_size_)
         return ParseResult::need_more(length_field_size_);
@@ -152,8 +152,15 @@ ParseResult LengthPrefixedFramer::parse(const ReceiveCursor& cursor, bool /*at_e
     const std::uint64_t length = decode_length(hdr, length_field_size_, byte_order_);
 
     const std::size_t total = length_field_size_ + static_cast<std::size_t>(length);
-    if (avail < total)
+    if (avail < total) {
+        // The stream ended inside this record's body: deliver what arrived as a
+        // partial Message (RFC 9623 Section 5.2); the Connection then reports the
+        // record as incomplete.
+        if (at_eof && avail > length_field_size_)
+            return ParseResult::emit(avail - length_field_size_, /*eom=*/false,
+                                     /*discard_before=*/length_field_size_);
         return ParseResult::need_more(total);
+    }
 
     return ParseResult::emit(static_cast<std::size_t>(length), /*eom=*/true,
                              /*discard_before=*/length_field_size_);

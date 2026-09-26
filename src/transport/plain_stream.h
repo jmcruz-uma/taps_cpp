@@ -1,6 +1,7 @@
 #pragma once
 
 #include "transport/byte_stream.h"
+#include "transport/io_error.h"
 
 #include <asio/error.hpp>
 #include <asio/ip/tcp.hpp>
@@ -25,7 +26,7 @@ public:
         if (ec == asio::error::eof)
             co_return std::size_t{0};
         if (ec)
-            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, ec.message()});
+            co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
         co_return n;
     }
 
@@ -35,7 +36,7 @@ public:
         const std::size_t n = co_await asio::async_write(
             socket_, buffers, asio::redirect_error(asio::use_awaitable, ec));
         if (ec)
-            co_return std::unexpected(TAPSError{ErrorType::CONNECTION_FAILED, ec.message()});
+            co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
         co_return n;
     }
 
@@ -43,7 +44,7 @@ public:
         asio::error_code ec;
         socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
         if (ec)
-            co_return std::unexpected(TAPSError{ErrorType::INTERNAL_ERROR, ec.message()});
+            co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
         co_return std::expected<void, TAPSError>{std::in_place};
     }
 
