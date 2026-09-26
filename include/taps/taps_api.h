@@ -486,12 +486,27 @@ public:
     
     virtual asio::awaitable<Result<void>> send(const Message& message) = 0;
     virtual asio::awaitable<Result<Message>> receive() = 0;
+
+    // Graceful termination (RFC 9622 Section 10; for TCP, RFC 9623 Section 10.1):
+    // ends this side and completes, in state CLOSED, once the peer has ended its
+    // side. What the peer still sends meanwhile is discarded, and a pending
+    // receive() completes with RECEIVE_ERROR / INVALID_STATE. Must not be called
+    // while a send() is pending. A peer that never ends keeps close() waiting;
+    // abort() ends it.
     virtual asio::awaitable<Result<void>> close() = 0;
+    // Immediate termination: pending operations complete with CONNECTION_ERROR /
+    // LOCAL_ABORT.
     virtual asio::awaitable<Result<void>> abort() = 0;
     
     virtual RemoteEndpoint get_remote_endpoint() const = 0;
     virtual LocalEndpoint get_local_endpoint() const = 0;
     ConnectionState state() const noexcept{ return state_; }
+
+    // RFC 9622 Sections 8.1.11.2 and 8.1.11.3 (canSend, canReceive). After the
+    // peer has ended its side of a TCP connection the Connection stays ESTABLISHED
+    // and can still send, but no longer receive (RFC 9623 Section 10.1).
+    virtual bool can_send() const noexcept { return state_ == ConnectionState::ESTABLISHED; }
+    virtual bool can_receive() const noexcept { return state_ == ConnectionState::ESTABLISHED; }
 
     virtual void set_framer(std::unique_ptr<MessageFramer> framer){
         framer_ = std::move(framer);
@@ -632,6 +647,7 @@ public:
     RemoteEndpoint get_remote_endpoint() const override;
     LocalEndpoint get_local_endpoint() const override;
     std::optional<SecurityInfo> security_info() override;
+    bool can_receive() const noexcept override;
 
     asio::awaitable<Result<void>> connect();
 
@@ -660,6 +676,9 @@ private:
     // Bytes received but not yet parsed by the framer, behind the receive cursor.
     std::unique_ptr<BlockChain> receive_chain_;
     bool receive_eof_ = false;
+    // The end of the peer's stream (or the error that ended it) has been delivered:
+    // receive() has nothing more to return.
+    bool receive_ended_ = false;
     // The last Message delivered had endOfMessage = false: a later end of stream
     // leaves that Message incomplete.
     bool message_open_ = false;
@@ -730,6 +749,9 @@ public:
     asio::awaitable<Result<Message>> receive() override;
     asio::awaitable<Result<void>> close() override;
     asio::awaitable<Result<void>> abort() override;
+
+    // The socket is opened by the first send(): sending is possible before then.
+    bool can_send() const noexcept override { return state_ != ConnectionState::CLOSED; }
 
     RemoteEndpoint get_remote_endpoint() const override;
     LocalEndpoint get_local_endpoint() const override;

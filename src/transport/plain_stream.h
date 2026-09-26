@@ -9,7 +9,26 @@
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
 
+#include <array>
+#include <cstddef>
+
 namespace taps {
+
+// Reads and discards until the peer ends its side of the connection (EOF). Used
+// after this side has ended, so that the socket is released with nothing unread:
+// the kernel resets, instead of finishing, a connection closed with unread data.
+inline asio::awaitable<Result<void>> drain_until_eof(asio::ip::tcp::socket& socket) {
+    std::array<std::byte, 4096> sink;
+    for (;;) {
+        asio::error_code ec;
+        co_await socket.async_read_some(asio::buffer(sink),
+                                        asio::redirect_error(asio::use_awaitable, ec));
+        if (ec == asio::error::eof)
+            co_return std::expected<void, TAPSError>{std::in_place};
+        if (ec)
+            co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
+    }
+}
 
 // A ByteStream that forwards directly to a connected TCP socket. Holds the socket
 // by reference: the owning TCPConnection keeps it alive (stream_ is declared after
@@ -42,10 +61,10 @@ public:
 
     asio::awaitable<Result<void>> shutdown() override {
         asio::error_code ec;
-        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        socket_.shutdown(asio::ip::tcp::socket::shutdown_send, ec);
         if (ec)
             co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
-        co_return std::expected<void, TAPSError>{std::in_place};
+        co_return co_await drain_until_eof(socket_);
     }
 
 private:

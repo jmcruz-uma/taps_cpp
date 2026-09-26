@@ -111,10 +111,10 @@ namespace taps {
     }
     
     asio::awaitable<Result<Message>> TCPConnection::receive() {
-        if (state_ != ConnectionState::ESTABLISHED) {
+        if (!can_receive()) {
             co_return std::unexpected(TAPSError(
                 ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE,
-                receive_eof_ ? "the stream has ended: no more Messages" : "Connection not established"));
+                receive_ended_ ? "the stream has ended: no more Messages" : "Connection not established"));
         }
         
         try {
@@ -138,8 +138,11 @@ namespace taps {
         
         state_ = ConnectionState::CLOSING;
 
-        // Graceful shutdown of the write direction (TCP FIN / TLS close_notify),
-        // then hard-close the socket.
+        // A pending receive() completes with RECEIVE_ERROR / INVALID_STATE: after
+        // Close the application must not rely on receiving (RFC 9622 Section 10).
+        // Then end this side and wait for the peer's end (RFC 9623 Section 10.1).
+        asio::error_code cancel_ec;
+        socket_.cancel(cancel_ec);
         auto sd = co_await stream_->shutdown();
         asio::error_code ec;
         socket_.close(ec);
@@ -152,10 +155,13 @@ namespace taps {
         co_return std::expected<void, TAPSError>{std::in_place};
     }
     
-    // Pending operations complete with CONNECTION_ERROR / LOCAL_ABORT.
+    // RFC 9623 Section 10.1: the connection is reset (RST), not finished. Pending
+    // operations complete with CONNECTION_ERROR / LOCAL_ABORT.
     asio::awaitable<Result<void>> TCPConnection::abort(){
         aborted_ = true;
         asio::error_code ec;
+        if (socket_.is_open())
+            socket_.set_option(asio::socket_base::linger(true, 0), ec);
         socket_.close(ec);
         state_ = ConnectionState::CLOSED;
         if (ec)
@@ -309,7 +315,7 @@ namespace taps {
                     co_return std::unexpected(receive_failure(TAPSError{
                         ErrorEvent::RECEIVE_ERROR, ErrorReason::DEFRAMING_FAILED, what}));
                 }
-                state_ = ConnectionState::CLOSED;
+                receive_ended_ = true;
                 co_return Message(std::make_shared<BlockChain>(), MessageContext{},
                                   /*end_of_message=*/true);
             }
@@ -333,8 +339,8 @@ namespace taps {
         if (!chunk)
             co_return std::unexpected(receive_failure(chunk.error()));
         if (!*chunk) {
-            // Graceful close: final fragment, empty, endOfMessage = true.
-            state_ = ConnectionState::CLOSED;
+            // The peer ended its side: final fragment, empty, endOfMessage = true.
+            receive_ended_ = true;
             co_return Message(std::make_shared<BlockChain>(), MessageContext{},
                               /*end_of_message=*/true);
         }
@@ -345,16 +351,22 @@ namespace taps {
     }
 
     // A pending read cancelled by close() is reported as INVALID_STATE (by abort(),
-    // it stays LOCAL_ABORT). The state follows the event: a CONNECTION_ERROR ends the
-    // Connection, and so does a RECEIVE_ERROR once the stream itself has ended, as
-    // a clean end does; any other RECEIVE_ERROR leaves it as it was.
+    // it stays LOCAL_ABORT). A CONNECTION_ERROR ends the Connection. A RECEIVE_ERROR
+    // leaves it ESTABLISHED; once the peer's stream has ended, it is the last
+    // receive result, and the Connection can still send (RFC 9623 Section 10.1).
     TAPSError TCPConnection::receive_failure(TAPSError error) {
         if (error.reason() == ErrorReason::LOCAL_ABORT && !aborted_)
             error = TAPSError{ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE,
                               "Connection closed locally"};
-        if (error.event() == ErrorEvent::CONNECTION_ERROR || receive_eof_)
+        if (error.event() == ErrorEvent::CONNECTION_ERROR)
             state_ = ConnectionState::CLOSED;
+        else if (receive_eof_)
+            receive_ended_ = true;
         return error;
+    }
+
+    bool TCPConnection::can_receive() const noexcept {
+        return state_ == ConnectionState::ESTABLISHED && !receive_ended_;
     }
 
 

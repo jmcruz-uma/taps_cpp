@@ -3,8 +3,9 @@
 // records around block boundaries, a stream ending inside a record or a header,
 // a framer that makes no progress, whole-transfer delivery, echoing received
 // (chain-backed) Messages, receive-pool exhaustion, a pending receive() interrupted
-// by abort(), establishment and listen errors, UDP datagram echo and UDP idle
-// eviction. Errors are checked as RFC 9622 event + RFC 9623 Appendix B reason.
+// by abort(), replying after the peer's end of stream, close() with unread data or
+// a pending receive(), abort() as a reset, establishment and listen errors, UDP
+// datagram echo and UDP idle eviction. Errors are checked as RFC 9622 event + RFC 9623 Appendix B reason.
 
 #include "taps/taps_api.h"
 #include "taps/message_framer.h"
@@ -13,14 +14,17 @@
 
 #include <asio.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace taps;
@@ -95,6 +99,22 @@ static asio::awaitable<std::unique_ptr<Connection>> connect_tcp(TransportService
     co_return std::move(*cr);
 }
 
+// Completion handler for spawned coroutines: an escaping exception is a failure.
+static void fail_on_exception(std::exception_ptr e) {
+    if (!e) return;
+    try { std::rethrow_exception(e); }
+    catch (const std::exception& x) { std::printf("FAIL  coroutine threw: %s\n", x.what()); }
+    ++g_failures;
+}
+
+// A test body that never reached its end is a failure.
+static void check_finished(bool finished, const char* test) {
+    if (!finished) {
+        std::printf("FAIL  %s: did not finish\n", test);
+        ++g_failures;
+    }
+}
+
 template <typename T>
 static bool is_error(const Result<T>& r, ErrorEvent event, ErrorReason reason) {
     return !r && r.error().event() == event && r.error().reason() == reason;
@@ -113,17 +133,21 @@ static auto raw_server(std::uint16_t port, std::vector<std::uint8_t> bytes) {
 
 // Runs a server and a client coroutine on a fresh io_context; the client starts after
 // a short delay so the server is listening, and stops the context when done.
+// An exception escaping either side, or a client that never finishes, is a failure.
 template <typename Server, typename Client>
 static void scenario(Server server, Client client) {
     asio::io_context ctx;
-    asio::co_spawn(ctx, server(ctx), asio::detached);
-    asio::co_spawn(ctx, [&ctx, client]() -> asio::awaitable<void> {
+    bool client_finished = false;
+    asio::co_spawn(ctx, server(ctx), fail_on_exception);
+    asio::co_spawn(ctx, [&ctx, client, &client_finished]() -> asio::awaitable<void> {
         asio::steady_timer t(ctx, std::chrono::milliseconds(100));
         co_await t.async_wait(asio::use_awaitable);
         co_await client(ctx);
+        client_finished = true;
         ctx.stop();
-    }, asio::detached);
+    }, fail_on_exception);
     ctx.run();
+    check_finished(client_finished, "scenario client");
 }
 
 // A server that accepts one connection, sends `data` as one Message and closes.
@@ -164,9 +188,11 @@ static void test_unframed_stream() {
         CHECK(equals(got, data), "unframed: whole stream arrives byte-exact");
         CHECK(partial_flags_ok, "unframed: data Messages are partial (end_of_message == false)");
         CHECK(ended, "unframed: end of stream is an empty Message with end_of_message == true");
-        CHECK(conn->state() == ConnectionState::CLOSED, "unframed: connection is CLOSED after end of stream");
+        CHECK(conn->state() == ConnectionState::ESTABLISHED && conn->can_send() && !conn->can_receive(),
+              "unframed: after the end of stream the connection can still send, not receive");
         auto again = co_await conn->receive();
-        CHECK(!again, "unframed: receive() after end of stream fails");
+        CHECK(is_error(again, ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE),
+              "unframed: receive() after end of stream is RECEIVE_ERROR / INVALID_STATE");
     });
 }
 
@@ -215,7 +241,8 @@ static void test_framed_records() {
             auto last = co_await conn->receive();
             CHECK(last && last->size() == 0 && last->is_end_of_message(),
                   "framed: end of stream is an empty Message with end_of_message == true");
-            CHECK(conn->state() == ConnectionState::CLOSED, "framed: connection is CLOSED after end of stream");
+            CHECK(conn->state() == ConnectionState::ESTABLISHED && conn->can_send() && !conn->can_receive(),
+                  "framed: after the end of stream the connection can still send, not receive");
         });
 }
 
@@ -240,7 +267,8 @@ static void test_framed_eof_inside_record() {
         auto err = co_await conn->receive();
         CHECK(is_error(err, ErrorEvent::RECEIVE_ERROR, ErrorReason::DEFRAMING_FAILED),
               "framed, EOF in body: then RECEIVE_ERROR / DEFRAMING_FAILED");
-        CHECK(conn->state() == ConnectionState::CLOSED, "framed, EOF in body: connection is CLOSED");
+        CHECK(conn->state() == ConnectionState::ESTABLISHED && conn->can_send() && !conn->can_receive(),
+              "framed, EOF in body: the connection can still send, not receive");
         auto again = co_await conn->receive();
         CHECK(is_error(again, ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE),
               "framed, EOF in body: a further receive() is RECEIVE_ERROR / INVALID_STATE");
@@ -266,7 +294,8 @@ static void test_framed_eof_inside_header() {
         auto err = co_await conn->receive();
         CHECK(is_error(err, ErrorEvent::RECEIVE_ERROR, ErrorReason::DEFRAMING_FAILED),
               "framed, EOF in header: then RECEIVE_ERROR / DEFRAMING_FAILED");
-        CHECK(conn->state() == ConnectionState::CLOSED, "framed, EOF in header: connection is CLOSED");
+        CHECK(conn->state() == ConnectionState::ESTABLISHED && conn->can_send() && !conn->can_receive(),
+              "framed, EOF in header: the connection can still send, not receive");
     });
 }
 
@@ -316,7 +345,8 @@ static void test_whole_transfer(bool gather, std::uint16_t port) {
         auto end = co_await conn->receive();
         CHECK(end && end->size() == 0 && end->is_end_of_message(),
               "whole transfer: then the end of stream (empty Message)");
-        CHECK(conn->state() == ConnectionState::CLOSED, "whole transfer: connection is CLOSED after the end");
+        CHECK(conn->state() == ConnectionState::ESTABLISHED && conn->can_send() && !conn->can_receive(),
+              "whole transfer: after the end the connection can still send, not receive");
         auto again = co_await conn->receive();
         CHECK(is_error(again, ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE),
               "whole transfer: a further receive() is RECEIVE_ERROR / INVALID_STATE");
@@ -445,13 +475,14 @@ static void test_receive_interrupted_by_abort() {
     asio::io_context ctx;
     std::unique_ptr<Listener> listener;
     std::unique_ptr<Connection> server_conn;
+    bool finished = false;
     asio::co_spawn(ctx, [&]() -> asio::awaitable<void> {
         TransportServices ts(ctx);
         listener = co_await listen_tcp(ts, port);
         if (!listener) co_return;
         auto ar = co_await listener->accept();
         if (ar) server_conn = std::move(*ar);   // kept open, never sends
-    }, asio::detached);
+    }, fail_on_exception);
     asio::co_spawn(ctx, [&]() -> asio::awaitable<void> {
         asio::steady_timer t(ctx, std::chrono::milliseconds(100));
         co_await t.async_wait(asio::use_awaitable);
@@ -468,9 +499,11 @@ static void test_receive_interrupted_by_abort() {
         CHECK(is_error(rr, ErrorEvent::CONNECTION_ERROR, ErrorReason::LOCAL_ABORT),
               "abort: a pending receive() completes with CONNECTION_ERROR / LOCAL_ABORT");
         CHECK(conn->state() == ConnectionState::CLOSED, "abort: connection is CLOSED");
+        finished = true;
         ctx.stop();
-    }, asio::detached);
+    }, fail_on_exception);
     ctx.run();
+    check_finished(finished, "abort test");
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +552,8 @@ static void test_udp_echo() {
 // ---------------------------------------------------------------------------
 static void test_establishment_errors() {
     asio::io_context ctx;
-    asio::co_spawn(ctx, [&ctx]() -> asio::awaitable<void> {
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
         TransportServices ts(ctx);
         auto pc = ts.preconnect(LocalEndpoint{}, RemoteEndpoint{"127.0.0.1", 19993}, tcp_props());
         auto cr = co_await pc.initiate();
@@ -530,8 +564,10 @@ static void test_establishment_errors() {
         auto second = co_await ts.listen(LocalEndpoint{"127.0.0.1", 19994}, tcp_props());
         CHECK(first && is_error(second, ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::LOCAL_ENDPOINT_UNAVAILABLE),
               "listen on a port already in use: ESTABLISHMENT_ERROR / LOCAL_ENDPOINT_UNAVAILABLE");
-    }, asio::detached);
+        finished = true;
+    }, fail_on_exception);
     ctx.run();
+    check_finished(finished, "establishment test");
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +578,8 @@ static void test_udp_idle_eviction() {
     ::setenv("TAPS_UDP_IDLE_SECS", "1", 1);
     ::setenv("TAPS_UDP_SWEEP_SECS", "1", 1);
     asio::io_context ctx;
-    asio::co_spawn(ctx, [&ctx]() -> asio::awaitable<void> {
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
         TransportServices ts(ctx);
         auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
         if (!lr) { CHECK(false, "udp idle: listen"); co_return; }
@@ -566,10 +603,176 @@ static void test_udp_idle_eviction() {
         co_await listener->stop();
         asio::steady_timer t(ctx, std::chrono::milliseconds(50));
         co_await t.async_wait(asio::use_awaitable);
-    }, asio::detached);
+        finished = true;
+    }, fail_on_exception);
     ctx.run_for(std::chrono::seconds(10));
+    check_finished(finished, "udp idle test");
     ::unsetenv("TAPS_UDP_IDLE_SECS");
     ::unsetenv("TAPS_UDP_SWEEP_SECS");
+}
+
+// ---------------------------------------------------------------------------
+// End of the peer's stream and Close (RFC 9623 Section 10.1, TCP).
+// ---------------------------------------------------------------------------
+
+// Waits (up to one second) for the other side of a scenario to set `done`.
+static asio::awaitable<bool> wait_for(asio::io_context& ctx, const bool& done) {
+    for (int i = 0; i < 100 && !done; ++i) {
+        asio::steady_timer t(ctx, std::chrono::milliseconds(10));
+        co_await t.async_wait(asio::use_awaitable);
+    }
+    co_return done;
+}
+
+// Reads until the connection ends; returns the bytes and how it ended.
+static asio::awaitable<std::pair<std::vector<std::uint8_t>, asio::error_code>>
+read_to_end(asio::ip::tcp::socket& sock) {
+    std::vector<std::uint8_t> got;
+    std::array<std::uint8_t, 65536> buf;
+    for (;;) {
+        auto [ec, n] = co_await sock.async_read_some(asio::buffer(buf), asio::as_tuple(asio::use_awaitable));
+        got.insert(got.end(), buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(n));
+        if (ec) co_return std::pair{std::move(got), ec};
+    }
+}
+
+// The peer sends a request and ends its side; the Connection receives it to the end,
+// can still send, answers, and closes. The peer gets the whole answer and a clean end.
+static void test_reply_after_peer_end() {
+    constexpr std::uint16_t port = 19996;
+    const auto request = payload(4, 1000);
+    const auto response = payload(5, 1u << 20);
+    bool server_done = false;
+    scenario(
+        [&](asio::io_context& ctx) -> asio::awaitable<void> {
+            TransportServices ts(ctx);
+            auto l = co_await listen_tcp(ts, port);
+            if (!l) co_return;
+            auto ar = co_await l->accept();
+            if (!ar) { ++g_failures; co_return; }
+            auto conn = std::move(*ar);
+            std::vector<std::uint8_t> got;
+            for (;;) {
+                auto rr = co_await conn->receive();
+                if (!rr) break;
+                for (const auto b : rr->as_bytes()) got.push_back(std::to_integer<std::uint8_t>(b));
+                if (rr->is_end_of_message()) break;
+            }
+            CHECK(got == request && conn->state() == ConnectionState::ESTABLISHED &&
+                      conn->can_send() && !conn->can_receive(),
+                  "half-close: after the peer's end the request is complete and the connection can still send");
+            auto sr = co_await conn->send(make_message_view(std::span<const std::uint8_t>(response)));
+            CHECK(static_cast<bool>(sr), "half-close: send() after the peer's end succeeds");
+            auto cr = co_await conn->close();
+            CHECK(cr && conn->state() == ConnectionState::CLOSED, "half-close: close() completes, CLOSED");
+            server_done = true;
+        },
+        [&](asio::io_context& ctx) -> asio::awaitable<void> {
+            asio::ip::tcp::socket sock(ctx);
+            co_await sock.async_connect({asio::ip::make_address("127.0.0.1"), port}, asio::use_awaitable);
+            co_await asio::async_write(sock, asio::buffer(request), asio::use_awaitable);
+            sock.shutdown(asio::ip::tcp::socket::shutdown_send);
+            auto [got, ec] = co_await read_to_end(sock);
+            CHECK(got == response && ec == asio::error::eof,
+                  "half-close: the peer receives the whole answer, then a clean end (not a reset)");
+            CHECK(co_await wait_for(ctx, server_done), "half-close: the server side finished");
+        });
+}
+
+// close() with unread data from the peer: the Connection ends its side and waits for
+// the peer's end. Releasing the socket with unread data would make the kernel reset
+// the connection and drop what is still in its send buffer; the answer is larger than
+// the socket buffers and the peer starts reading late, so part of it is still queued
+// when close() is called.
+static void test_close_with_unread_data() {
+    constexpr std::uint16_t port = 19997;
+    const auto response = payload(6, 32u << 20);
+    bool server_done = false;
+    scenario(
+        [&](asio::io_context& ctx) -> asio::awaitable<void> {
+            TransportServices ts(ctx);
+            auto l = co_await listen_tcp(ts, port);
+            if (!l) co_return;
+            auto ar = co_await l->accept();
+            if (!ar) { ++g_failures; co_return; }
+            auto conn = std::move(*ar);
+            asio::steady_timer t(ctx, std::chrono::milliseconds(50));   // the peer's bytes arrive, unread
+            co_await t.async_wait(asio::use_awaitable);
+            co_await conn->send(make_message_view(std::span<const std::uint8_t>(response)));
+            auto cr = co_await conn->close();
+            CHECK(cr && conn->state() == ConnectionState::CLOSED,
+                  "close with unread data: close() completes once the peer has ended, CLOSED");
+            server_done = true;
+        },
+        [&](asio::io_context& ctx) -> asio::awaitable<void> {
+            asio::ip::tcp::socket sock(ctx);
+            co_await sock.async_connect({asio::ip::make_address("127.0.0.1"), port}, asio::use_awaitable);
+            const auto unread = payload(7, 1000);
+            co_await asio::async_write(sock, asio::buffer(unread), asio::use_awaitable);
+            asio::steady_timer late(ctx, std::chrono::milliseconds(200));
+            co_await late.async_wait(asio::use_awaitable);
+            auto [got, ec] = co_await read_to_end(sock);
+            asio::error_code ignored;
+            sock.shutdown(asio::ip::tcp::socket::shutdown_send, ignored);
+            CHECK(got.size() == response.size() && got == response && ec == asio::error::eof,
+                  "close with unread data: the peer receives everything, then a clean end (not a reset)");
+            if (got.size() != response.size() || ec != asio::error::eof)
+                std::printf("      got %zu of %zu bytes, then %s\n", got.size(), response.size(), ec.message().c_str());
+            CHECK(co_await wait_for(ctx, server_done), "close with unread data: the server side finished");
+        });
+}
+
+// close() while a receive() is pending: the receive completes with INVALID_STATE.
+static void test_close_with_pending_receive() {
+    constexpr std::uint16_t port = 19998;
+    scenario(
+        [](asio::io_context& ctx) -> asio::awaitable<void> {
+            asio::ip::tcp::acceptor acc(ctx, {asio::ip::make_address("127.0.0.1"), port});
+            auto sock = co_await acc.async_accept(asio::use_awaitable);
+            auto [got, ec] = co_await read_to_end(sock);   // until the client's end
+            sock.shutdown(asio::ip::tcp::socket::shutdown_send);
+            (void)got; (void)ec;
+        },
+        [](asio::io_context& ctx) -> asio::awaitable<void> {
+            TransportServices ts(ctx);
+            auto conn = co_await connect_tcp(ts, port);
+            if (!conn) co_return;
+            Connection* raw = conn.get();
+            Result<void> closed = std::unexpected(TAPSError{ErrorEvent::CONNECTION_ERROR, ErrorReason::INTERNAL_ERROR, ""});
+            bool close_done = false;
+            asio::co_spawn(ctx, [&ctx, raw, &closed, &close_done]() -> asio::awaitable<void> {
+                asio::steady_timer t(ctx, std::chrono::milliseconds(50));
+                co_await t.async_wait(asio::use_awaitable);
+                closed = co_await raw->close();
+                close_done = true;
+            }, asio::detached);
+            auto rr = co_await conn->receive();
+            CHECK(is_error(rr, ErrorEvent::RECEIVE_ERROR, ErrorReason::INVALID_STATE),
+                  "close with a pending receive: the receive completes with RECEIVE_ERROR / INVALID_STATE");
+            const bool finished = co_await wait_for(ctx, close_done);
+            CHECK(finished && closed && conn->state() == ConnectionState::CLOSED,
+                  "close with a pending receive: close() completes, CLOSED");
+        });
+}
+
+// abort() resets the connection (RFC 9623 Section 10.1: ABORT.TCP sends a RST).
+static void test_abort_resets() {
+    constexpr std::uint16_t port = 19999;
+    scenario(
+        [](asio::io_context& ctx) -> asio::awaitable<void> {
+            TransportServices ts(ctx);
+            auto l = co_await listen_tcp(ts, port);
+            if (!l) co_return;
+            auto ar = co_await l->accept();
+            if (!ar) { ++g_failures; co_return; }
+            co_await (*ar)->abort();
+        },
+        [](asio::io_context& ctx) -> asio::awaitable<void> {
+            asio::ip::tcp::socket sock(ctx);
+            co_await sock.async_connect({asio::ip::make_address("127.0.0.1"), port}, asio::use_awaitable);
+            auto [got, ec] = co_await read_to_end(sock);
+            CHECK(got.empty() && ec == asio::error::connection_reset, "abort: the peer sees a reset");
+        });
 }
 
 int main() {
@@ -585,6 +788,10 @@ int main() {
     test_echo(/*framed=*/true, 19989, "echo: framed received Messages (up to 200000 bytes) are sent back byte-exact");
     test_pool_exhaustion();
     test_receive_interrupted_by_abort();
+    test_reply_after_peer_end();
+    test_close_with_unread_data();
+    test_close_with_pending_receive();
+    test_abort_resets();
     test_establishment_errors();
     test_udp_echo();
     test_udp_idle_eviction();

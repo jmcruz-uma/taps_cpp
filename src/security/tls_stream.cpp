@@ -1,11 +1,13 @@
 #include "security/tls_stream.h"
 #include "transport/io_error.h"
+#include "transport/plain_stream.h"   // drain_until_eof
 
 #include <asio/redirect_error.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
 
 #include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 
 namespace taps {
@@ -111,16 +113,18 @@ asio::awaitable<Result<std::size_t>> TlsStream::write(
 }
 
 asio::awaitable<Result<void>> TlsStream::shutdown() {
-    // Sends our close_notify. asio's async_shutdown also waits for the peer's;
-    // for the cooperating peers in this benchmark that returns promptly, and
-    // TCPConnection::close() hard-closes the socket straight after regardless.
-    // eof / stream_truncated here just mean the peer already went away.
+    // async_shutdown sends our close_notify and then waits for the peer's. It ends
+    // with eof or stream_truncated when the peer's side had already ended, and fails
+    // with "application data after close notify" when the peer is still sending:
+    // that data is discarded at the TCP level until the peer ends.
     asio::error_code ec;
     co_await ssl_.async_shutdown(asio::redirect_error(asio::use_awaitable, ec));
-    if (ec && ec != asio::error::eof && ec != asio::ssl::error::stream_truncated) {
-        co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
-    }
-    co_return std::expected<void, TAPSError>{std::in_place};
+    if (!ec || ec == asio::error::eof || ec == asio::ssl::error::stream_truncated)
+        co_return std::expected<void, TAPSError>{std::in_place};
+    if (ec.category() == asio::error::get_ssl_category() &&
+        ERR_GET_REASON(static_cast<unsigned long>(ec.value())) == SSL_R_APPLICATION_DATA_AFTER_CLOSE_NOTIFY)
+        co_return co_await drain_until_eof(ssl_.next_layer());
+    co_return std::unexpected(io_error(ErrorEvent::CONNECTION_ERROR, ec));
 }
 
 }  // namespace taps

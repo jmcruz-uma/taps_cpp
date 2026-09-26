@@ -33,8 +33,11 @@ public:
     virtual asio::awaitable<Result<std::size_t>> write(
         std::span<const asio::const_buffer> buffers) = 0;
 
-    // Graceful shutdown of the write direction: a TCP FIN for a PlainStream, a TLS
-    // close_notify for a TlsStream. A failure is a CONNECTION_ERROR.
+    // Graceful end of the connection (RFC 9623 Section 10.1, Close): ends this side
+    // (a TCP FIN, or a TLS close_notify) and completes once the peer has ended its
+    // side, discarding whatever the peer still sends. Only the send direction is
+    // shut down first, so the peer can finish its own sending. A failure is a
+    // CONNECTION_ERROR.
     virtual asio::awaitable<Result<void>> shutdown() = 0;
 
     // The negotiated TLS parameters, for diagnostics only (see SecurityInfo). A
