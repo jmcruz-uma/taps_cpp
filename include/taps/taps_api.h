@@ -654,6 +654,7 @@ private:
 
     asio::awaitable<Result<std::unique_ptr<Connection>>> initiate_with_single_endpoint();
     asio::awaitable<Result<std::unique_ptr<Connection>>> happy_eyeballs_racing();
+    asio::awaitable<Result<std::unique_ptr<Connection>>> initiate_udp();
     asio::awaitable<Result<std::unique_ptr<Connection>>> race_connections(const std::vector<asio::ip::tcp::endpoint>& endpoints);
 
     // Post-connect establishment: applies the security provider to a freshly

@@ -30,7 +30,15 @@ Preconnection::~Preconnection() = default;
 // Preconnection Implementation
 // ============================================================================
 
+// The protocol is chosen from the Selection Properties (RFC 9622 Section 6.2): TCP
+// when reliability is required or preferred, UDP otherwise. Candidate racing
+// (RFC 9623 Section 4.3, RFC 8305) applies to TCP, over the addresses of every
+// remote endpoint. UDP has no handshake to race: the Connection is established on
+// the first address that resolves (RFC 9623 Section 10.3).
 asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate() {
+    if (!transport_properties_.requires_reliable_transport())
+        co_return co_await initiate_udp();
+
     // A single remote endpoint takes the direct path; two or more go through
     // Happy Eyeballs.
     if (remote_endpoints_.size() == 1) {
@@ -50,41 +58,41 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
     }
 
     auto& endpoint = asio_endpoints[0];
+    try {
+        auto tcp_conn = std::make_unique<TCPConnection>(io_context_, endpoint, memory_);
 
-    if (transport_properties_.requires_reliable_transport()) {
-        // TCP
-        try {
-            auto tcp_conn = std::make_unique<TCPConnection>(io_context_, endpoint, memory_);
-
-            auto connect_result = co_await tcp_conn->connect();
-            if (!connect_result) {
-                co_await tcp_conn->abort();
-                co_return std::unexpected(connect_result.error());
-            }
-
-            co_return co_await establish_connection(std::move(tcp_conn));
-        } catch (const std::exception& e) {
-            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
+        auto connect_result = co_await tcp_conn->connect();
+        if (!connect_result) {
+            co_await tcp_conn->abort();
+            co_return std::unexpected(connect_result.error());
         }
-    } else {
-        // No security protocol for datagrams here: requested security cannot be
-        // fulfilled (RFC 9622 Section 7.1), rather than silently not applied.
-        if (security_parameters_.is_enabled())
-            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::NO_CANDIDATES,
-                                                "security was requested, but no available protocol secures an unreliable transport"));
 
-        // UDP: convert the resolved TCP endpoint to a UDP one.
-        asio::ip::udp::endpoint udp_endpoint(endpoint.address(), endpoint.port());
-
-        try {
-            auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint, memory_);
-            if (auto opened = udp_conn->open(); !opened)
-                co_return std::unexpected(opened.error());
-            co_return std::unique_ptr<Connection>(std::move(udp_conn));
-        } catch (const std::exception& e) {
-            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
-        }
+        co_return co_await establish_connection(std::move(tcp_conn));
+    } catch (const std::exception& e) {
+        co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
     }
+}
+
+
+asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_udp() {
+    // No security protocol for datagrams here: requested security cannot be
+    // fulfilled (RFC 9622 Section 7.1), rather than silently not applied.
+    if (security_parameters_.is_enabled())
+        co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::NO_CANDIDATES,
+                                            "security was requested, but no available protocol secures an unreliable transport"));
+
+    for (auto& remote : remote_endpoints_) {
+        auto resolved = co_await remote.resolve(io_context_);
+        if (resolved.empty())
+            continue;
+        const asio::ip::udp::endpoint udp_endpoint(resolved[0].address(), resolved[0].port());
+        auto udp_conn = std::make_unique<ActiveUDPConnection>(io_context_, udp_endpoint, memory_);
+        if (auto opened = udp_conn->open(); !opened)
+            co_return std::unexpected(opened.error());
+        co_return std::unique_ptr<Connection>(std::move(udp_conn));
+    }
+    co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::RESOLUTION_FAILED,
+                                        "Failed to resolve any remote endpoint"));
 }
 
 

@@ -1003,6 +1003,36 @@ static void test_udp_passive_queue_drops_oldest() {
     check_finished(finished, "udp queue test");
 }
 
+// With several remote endpoints the protocol still follows the Selection
+// Properties: an unreliable Preconnection gives a UDP Connection, established on the
+// first endpoint (UDP has nothing to race).
+static void test_udp_several_remote_endpoints() {
+    constexpr std::uint16_t first = 19965, second = 19966;
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
+        asio::ip::udp::socket peer(ctx, asio::ip::udp::endpoint(asio::ip::make_address("127.0.0.1"), first));
+        TransportServices ts(ctx);
+        auto pc = ts.preconnect(LocalEndpoint{}, RemoteEndpoint{"127.0.0.1", first}, udp_props());
+        pc.add_remote_endpoint(RemoteEndpoint{"127.0.0.1", second});
+        auto cr = co_await pc.initiate();
+        if (!cr) { CHECK(false, "udp several endpoints: initiate"); co_return; }
+        const bool is_udp = dynamic_cast<ActiveUDPConnection*>(cr->get()) != nullptr;
+        const std::uint8_t d = 'm';
+        co_await (*cr)->send(make_message_view(std::span<const std::uint8_t>(&d, 1)));
+        std::uint8_t got = 0;
+        asio::ip::udp::endpoint from;
+        auto [ec, n] = co_await peer.async_receive_from(asio::buffer(&got, 1), from,
+                                                        asio::as_tuple(asio::use_awaitable));
+        CHECK(is_udp && !ec && n == 1 && got == 'm',
+              "udp: with several remote endpoints the connection is UDP, on the first endpoint");
+        co_await (*cr)->close();
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(5));
+    check_finished(finished, "udp several endpoints test");
+}
+
 int main() {
     test_unframed_stream();
     test_framed_records();
@@ -1025,6 +1055,7 @@ int main() {
     test_udp_idle_eviction();
     test_udp_receive_before_send();
     test_udp_passive_queue_drops_oldest();
+    test_udp_several_remote_endpoints();
     test_udp_connection_outlives_listener();
     test_udp_listener_stop();
     test_udp_source_after_connection_destroyed();
