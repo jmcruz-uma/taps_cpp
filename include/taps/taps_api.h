@@ -9,7 +9,6 @@
 #include <asio/experimental/channel.hpp>
 
 #include "taps/message_framer.h"   // taps::MessageFramer (API v2), ReceiveCursor, ParseResult
-#include "taps/mailbox.h"          // Mailbox::CloseCause (UDPListener::evict)
 
 #include <string>
 #include <vector>
@@ -46,6 +45,7 @@ class SecurityParameters;
 class LocalEndpoint;
 class RemoteEndpoint;
 class Mailbox;
+class UDPDemux;
 
 // ============================================================================
 // Error Handling
@@ -711,7 +711,9 @@ private:
 class PassiveUDPConnection : public Connection {
 public:
 
-    explicit PassiveUDPConnection(asio::ip::udp::socket& socket, asio::ip::udp::endpoint endpoint, std::shared_ptr<Mailbox> mailbox);
+    // Created by the UDP Listener's demultiplexer for each new source.
+    PassiveUDPConnection(std::shared_ptr<UDPDemux> demux, asio::ip::udp::endpoint remote,
+                         std::shared_ptr<Mailbox> mailbox);
     ~PassiveUDPConnection();
 
     asio::awaitable<Result<void>> send(const Message& message) override;
@@ -726,16 +728,17 @@ public:
     // the application was not consuming fast enough. UDP has no flow control.
     std::size_t datagrams_dropped() const noexcept;
 
-    friend class UDPListener;
+    friend class UDPDemux;
 
 private:
-    asio::ip::udp::socket & socket_; //referencia al socket del UDPListener
-    asio::ip::udp::endpoint remote_endpoint_;
-    asio::ip::udp::endpoint local_endpoint_;
+    // Removes this Connection's source from the demultiplexer, once.
+    void release() noexcept;
 
+    std::shared_ptr<UDPDemux> demux_;   // shared with the Listener and its other Connections
+    asio::ip::udp::endpoint remote_endpoint_;
     std::shared_ptr<Mailbox> mailbox_;
-    std::function<void()> on_close_;
     bool aborted_ = false;
+    bool released_ = false;
 };
 
 class ActiveUDPConnection : public Connection {
@@ -796,40 +799,17 @@ public:
                         TransportProperties properties = {},
                         SecurityParameters security = {},
                         std::shared_ptr<BlockPoolFactory> pool_factory = nullptr);
-    ~UDPListener();  // out-of-line: block_pool_ points to a private type
+    // Stops accepting; Connections already accepted keep working (they share the
+    // socket, which closes when the last of them goes).
+    ~UDPListener();
 
     asio::awaitable<Result<void>> listen() override;
     asio::awaitable<Result<std::unique_ptr<Connection>>> accept() override;
     asio::awaitable<Result<void>> stop() override;
 
 private:
-    // One live logical connection (one source endpoint) and its last-activity time.
-    struct Conn {
-        asio::ip::udp::endpoint             endpoint;
-        std::shared_ptr<Mailbox>            mailbox;
-        std::chrono::steady_clock::time_point last_active;
-    };
-
     asio::io_context& io_context_;
-    asio::ip::udp::socket socket_;
-
-    asio::strand<asio::io_context::executor_type> strand_;
-
-    // LRU of live logical connections, most-recent-first; index_ maps a source
-    // endpoint to its node. Both are touched only on strand_.
-    std::list<Conn> lru_;
-    std::unordered_map<asio::ip::udp::endpoint, std::list<Conn>::iterator> index_;
-
-    asio::experimental::channel<void(std::error_code, std::unique_ptr<PassiveUDPConnection>)> accept_channel_;
-    // One shared pool for the single receive loop; datagrams are one block each.
-    std::unique_ptr<BlockPool> block_pool_;
-    asio::steady_timer sweep_timer_;
-
-    // Demux helpers, all run on strand_.
-    std::shared_ptr<Mailbox> touch_or_create(const asio::ip::udp::endpoint& sender,
-                                             bool& is_new);
-    void evict(std::list<Conn>::iterator it, Mailbox::CloseCause cause);
-    asio::awaitable<void> sweep_loop();
+    std::shared_ptr<UDPDemux> demux_;   // socket, demultiplexing table, receive loop
 };
 
 // ============================================================================

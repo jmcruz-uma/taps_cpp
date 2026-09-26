@@ -5,7 +5,8 @@
 // (chain-backed) Messages, receive-pool exhaustion, a pending receive() interrupted
 // by abort(), replying after the peer's end of stream, close() with unread data or
 // a pending receive(), abort() as a reset, establishment and listen errors, UDP
-// datagram echo and UDP idle eviction. Errors are checked as RFC 9622 event + RFC 9623 Appendix B reason.
+// datagram echo, UDP idle eviction, and the UDP Listener's lifetime (passive
+// Connections outlive it; stop() only stops accepting new sources). Errors are checked as RFC 9622 event + RFC 9623 Appendix B reason.
 
 #include "taps/taps_api.h"
 #include "taps/message_framer.h"
@@ -775,6 +776,165 @@ static void test_abort_resets() {
         });
 }
 
+// ---------------------------------------------------------------------------
+// UDP Listener lifetime: passive Connections outlive their Listener, stop() only
+// stops accepting new sources, and a source whose Connection is gone gets a new one
+// (RFC 9623 Section 4.7.2).
+// ---------------------------------------------------------------------------
+
+// A plain UDP peer: sends one byte `b` to the listener.
+static asio::awaitable<void> udp_send_byte(asio::ip::udp::socket& peer, std::uint16_t port, std::uint8_t b) {
+    co_await peer.async_send_to(asio::buffer(&b, 1), {asio::ip::make_address("127.0.0.1"), port},
+                                asio::use_awaitable);
+}
+
+static asio::awaitable<void> pause(asio::io_context& ctx, int ms) {
+    asio::steady_timer t(ctx, std::chrono::milliseconds(ms));
+    co_await t.async_wait(asio::use_awaitable);
+}
+
+static bool one_byte(const Result<Message>& r, std::uint8_t b) {
+    return r && r->size() == 1 && std::to_integer<std::uint8_t>(r->as_bytes()[0]) == b;
+}
+
+static void test_udp_connection_outlives_listener() {
+    constexpr std::uint16_t port = 19960;
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp outlives listener: listen"); co_return; }
+        auto listener = std::move(*lr);
+        asio::ip::udp::socket peer(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+        co_await udp_send_byte(peer, port, 'a');
+        auto ar = co_await listener->accept();
+        if (!ar) { CHECK(false, "udp outlives listener: accept"); co_return; }
+        auto conn = std::move(*ar);
+        auto first = co_await conn->receive();
+
+        listener.reset();                 // destroyed without stop(), receive loop pending
+        co_await pause(ctx, 50);
+
+        co_await udp_send_byte(peer, port, 'b');
+        auto second = co_await conn->receive();
+        CHECK(one_byte(first, 'a') && one_byte(second, 'b'),
+              "udp: a passive connection keeps receiving after its Listener is destroyed");
+        const std::uint8_t c = 'c';
+        auto sr = co_await conn->send(make_message_view(std::span<const std::uint8_t>(&c, 1)));
+        std::uint8_t got = 0;
+        asio::ip::udp::endpoint from;
+        auto [ec, n] = co_await peer.async_receive_from(asio::buffer(&got, 1), from,
+                                                        asio::as_tuple(asio::use_awaitable));
+        CHECK(sr && !ec && n == 1 && got == 'c',
+              "udp: a passive connection keeps sending after its Listener is destroyed");
+        co_await conn->close();
+        co_await pause(ctx, 50);
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(10));
+    check_finished(finished, "udp outlives listener test");
+}
+
+static void test_udp_listener_stop() {
+    constexpr std::uint16_t port = 19961;
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp stop: listen"); co_return; }
+        auto listener = std::move(*lr);
+        asio::ip::udp::socket peer1(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+        asio::ip::udp::socket peer2(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+        co_await udp_send_byte(peer1, port, 'a');
+        auto ar = co_await listener->accept();
+        if (!ar) { CHECK(false, "udp stop: accept"); co_return; }
+        auto conn = std::move(*ar);
+        (void)co_await conn->receive();
+
+        Result<std::unique_ptr<Connection>> pending =
+            std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, "not run"});
+        bool pending_done = false;
+        Listener* raw = listener.get();
+        asio::co_spawn(ctx, [raw, &pending, &pending_done]() -> asio::awaitable<void> {
+            pending = co_await raw->accept();
+            pending_done = true;
+        }, fail_on_exception);
+        co_await pause(ctx, 20);
+        co_await listener->stop();
+        co_await pause(ctx, 20);
+        CHECK(pending_done && !pending && pending.error().event() == ErrorEvent::ESTABLISHMENT_ERROR &&
+                  pending.error().reason() == ErrorReason::INVALID_STATE,
+              "udp stop: a pending accept() completes with ESTABLISHMENT_ERROR / INVALID_STATE");
+
+        co_await udp_send_byte(peer2, port, 'x');     // a new source: no new Connection
+        co_await udp_send_byte(peer1, port, 'b');     // the existing source still delivers
+        auto r = co_await conn->receive();
+        CHECK(one_byte(r, 'b'), "udp stop: an existing connection keeps receiving after stop()");
+
+        // The shared socket stays bound while a Connection uses it and is released
+        // after the last one: a socket without SO_REUSEADDR can bind the port only then.
+        auto can_bind = [&ctx] {
+            asio::ip::udp::socket probe(ctx);
+            asio::error_code ec;
+            probe.open(asio::ip::udp::v4(), ec);
+            probe.bind({asio::ip::make_address("127.0.0.1"), port}, ec);
+            return !ec;
+        };
+        const bool bound_while_used = can_bind();
+        co_await conn->close();
+        co_await pause(ctx, 50);
+        CHECK(!bound_while_used && can_bind(),
+              "udp stop: the socket is released once the Listener has stopped and the last connection is closed");
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(10));
+    check_finished(finished, "udp stop test");
+}
+
+static void test_udp_source_after_connection_destroyed() {
+    constexpr std::uint16_t port = 19962;
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp new connection: listen"); co_return; }
+        auto listener = std::move(*lr);
+        asio::ip::udp::socket peer(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+        co_await udp_send_byte(peer, port, 'a');
+        {
+            auto ar = co_await listener->accept();
+            if (!ar) { CHECK(false, "udp new connection: first accept"); co_return; }
+            (void)co_await (*ar)->receive();
+        }                                              // destroyed without close()
+        co_await pause(ctx, 20);
+        co_await udp_send_byte(peer, port, 'b');
+        Listener* raw = listener.get();
+        Result<std::unique_ptr<Connection>> next =
+            std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, "not run"});
+        bool next_done = false;
+        asio::co_spawn(ctx, [raw, &next, &next_done]() -> asio::awaitable<void> {
+            next = co_await raw->accept();
+            next_done = true;
+        }, fail_on_exception);
+        co_await pause(ctx, 300);
+        bool second_ok = false;
+        if (next_done && next) {
+            auto r = co_await (*next)->receive();
+            second_ok = one_byte(r, 'b');
+            co_await (*next)->close();
+        }
+        CHECK(second_ok, "udp: after its Connection is destroyed, the same source gets a new Connection");
+        co_await listener->stop();
+        co_await pause(ctx, 50);
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(10));
+    check_finished(finished, "udp new connection test");
+}
+
 int main() {
     test_unframed_stream();
     test_framed_records();
@@ -795,6 +955,9 @@ int main() {
     test_establishment_errors();
     test_udp_echo();
     test_udp_idle_eviction();
+    test_udp_connection_outlives_listener();
+    test_udp_listener_stop();
+    test_udp_source_after_connection_destroyed();
 
     if (g_failures == 0) {
         std::printf("connection_test: all checks passed\n");

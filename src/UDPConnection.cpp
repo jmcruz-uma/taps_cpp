@@ -5,6 +5,7 @@
 #include "buffer/block_pool.h"
 #include "buffer/heap_block_pool.h"
 #include "transport/io_error.h"
+#include "udp_demux.h"
 #include <asio/co_spawn.hpp>
 #include <asio/use_awaitable.hpp>
 #include <algorithm>
@@ -42,23 +43,36 @@ TAPSError udp_failure(ErrorEvent event, const std::system_error& e, bool aborted
 // ============================================================================
 
 PassiveUDPConnection::PassiveUDPConnection(
-    asio::ip::udp::socket& socket,
+    std::shared_ptr<UDPDemux> demux,
     asio::ip::udp::endpoint remote,
     std::shared_ptr<Mailbox> mailbox)
-: socket_(socket)
+: demux_(std::move(demux))
 , remote_endpoint_(remote)
 , mailbox_(std::move(mailbox))
 {
     state_ = ConnectionState::ESTABLISHING;
 }
 
+// Destroyed without close(): the source still leaves the table, so a later
+// datagram from it creates a new Connection (RFC 9623 Section 4.7.2).
 PassiveUDPConnection::~PassiveUDPConnection() {
-    if (mailbox_)
-        mailbox_->close();
+    release();
+}
+
+void PassiveUDPConnection::release() noexcept {
+    if (released_)
+        return;
+    released_ = true;
+    demux_->release(remote_endpoint_, mailbox_.get());
 }
 
 asio::awaitable<Result<void>>
 PassiveUDPConnection::send(const Message& message) {
+    if (state_ == ConnectionState::CLOSED) {
+        co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::INVALID_STATE,
+                                            "Connection is closed"));
+    }
+    auto& socket = demux_->socket();
     try {
         const auto body = message.as_bytes();
         if (framer_) {
@@ -68,9 +82,9 @@ PassiveUDPConnection::send(const Message& message) {
             const std::array<asio::const_buffer, 2> iov{
                 asio::buffer(hdr.data(), hn),
                 asio::buffer(body.data(), body.size())};
-            co_await socket_.async_send_to(iov, remote_endpoint_, asio::use_awaitable);
+            co_await socket.async_send_to(iov, remote_endpoint_, asio::use_awaitable);
         } else {
-            co_await socket_.async_send_to(
+            co_await socket.async_send_to(
                 asio::buffer(body.data(), body.size()), remote_endpoint_,
                 asio::use_awaitable);
         }
@@ -108,11 +122,7 @@ PassiveUDPConnection::receive() {
 asio::awaitable<Result<void>>
 PassiveUDPConnection::close() {
     state_ = ConnectionState::CLOSED;
-    //mailbox_->close();
-    //mailbox_.reset();
-    if (on_close_) {
-        on_close_();
-    }
+    release();                                  // a pending receive() fails with INVALID_STATE
     co_return Result<void>{std::in_place};
 }
 
@@ -131,10 +141,11 @@ PassiveUDPConnection::get_remote_endpoint() const {
 
 LocalEndpoint
 PassiveUDPConnection::get_local_endpoint() const {
-    auto local = socket_.local_endpoint();
-    return LocalEndpoint(
-        local.address().to_string(),
-        local.port());
+    asio::error_code ec;
+    const auto local = demux_->socket().local_endpoint(ec);
+    if (ec)
+        return LocalEndpoint{};
+    return LocalEndpoint(local.address().to_string(), local.port());
 }
 
 std::size_t PassiveUDPConnection::datagrams_dropped() const noexcept {

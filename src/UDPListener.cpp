@@ -1,34 +1,23 @@
 #include "taps/taps_api.h"
 #include "taps/mailbox.h"
+#include "udp_demux.h"
 #include "buffer/block_chain.h"
 #include "buffer/block_pool.h"
 #include "buffer/heap_block_pool.h"
 #include "transport/io_error.h"
+#include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/dispatch.hpp>
 #include <asio/error.hpp>
+#include <asio/post.hpp>
 #include <asio/redirect_error.hpp>
 #include <asio/use_awaitable.hpp>
-#include <asio/as_tuple.hpp>
 #include <chrono>
 #include <cstdlib>
 #include <iterator>
 #include <memory>
 
 namespace taps {
-
-// ============================================================================
-// UDPListener
-//
-// Invariant: UDPListener outlives all PassiveUDPConnection instances.
-// on_close callbacks may safely capture `this`.
-//
-// One bound socket, one receive loop on strand_. Incoming datagrams are
-// demultiplexed by source endpoint into per-connection Mailboxes. The demux
-// table is a bounded LRU: a new source beyond kMaxConnections evicts the
-// least-recently-active one, and an idle sweep evicts sources quiet for longer
-// than kIdleTimeout. This keeps memory bounded under a spoofed-source flood
-// without attempting address validation (out of scope).
-// ============================================================================
 
 namespace {
 constexpr std::size_t kMaxConnections = 1024;
@@ -54,6 +43,143 @@ std::chrono::seconds sweep_interval() {
 }
 }  // namespace
 
+// ============================================================================
+// UDPDemux
+// ============================================================================
+
+UDPDemux::UDPDemux(asio::io_context& ctx, std::unique_ptr<BlockPool> pool)
+: socket_(ctx)
+, strand_(asio::make_strand(ctx))
+, pool_(std::move(pool))
+, sweep_timer_(strand_)
+, accept_channel_(ctx.get_executor(), 100)
+{}
+
+UDPDemux::~UDPDemux() = default;
+
+Result<void> UDPDemux::start(const asio::ip::udp::endpoint& local) {
+    try {
+        socket_.open(local.protocol());
+        socket_.set_option(asio::ip::udp::socket::reuse_address(true));
+        socket_.bind(local);
+    } catch (const std::system_error& e) {
+        return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, e.code()));
+    }
+    // Each coroutine holds a reference until the socket closes or the timer is
+    // cancelled (shut_down_if_unused()).
+    asio::co_spawn(strand_, [self = shared_from_this()] { return self->receive_loop(); },
+                   asio::detached);
+    asio::co_spawn(strand_, [self = shared_from_this()] { return self->sweep_loop(); },
+                   asio::detached);
+    return Result<void>{std::in_place};
+}
+
+asio::awaitable<void> UDPDemux::receive_loop() {
+    asio::ip::udp::endpoint sender;
+    for (;;) {
+        BlockRef block = pool_->acquire();
+        asio::error_code ec;
+        const std::size_t n = co_await socket_.async_receive_from(
+            asio::buffer(block.writable_data(), block.capacity_after_begin()),
+            sender, asio::redirect_error(asio::use_awaitable, ec));
+        if (ec == asio::error::operation_aborted)
+            co_return;                            // socket closed: nothing left to serve
+        if (ec)
+            continue;                             // transient receive error
+
+        auto datagram = std::make_shared<BlockChain>();
+        if (n > 0) {
+            block.set_range(0, n);
+            datagram->append(std::move(block));
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        std::shared_ptr<Mailbox> mailbox;
+        if (auto it = index_.find(sender); it != index_.end()) {
+            it->second->last_active = now;
+            lru_.splice(lru_.begin(), lru_, it->second);     // move to most recent
+            mailbox = it->second->mailbox;
+        } else {
+            if (!accepting_)
+                continue;                         // no Listener: no new Connections
+            if (index_.size() >= max_connections() && !lru_.empty())
+                evict(std::prev(lru_.end()), Mailbox::CloseCause::displaced);
+            mailbox = std::make_shared<Mailbox>(strand_);
+            lru_.push_front(Entry{sender, mailbox, now});
+            index_.emplace(sender, lru_.begin());
+
+            // Non-blocking: if accept() is not keeping up, drop the new source
+            // rather than stall the demux for everyone.
+            auto conn = std::make_unique<PassiveUDPConnection>(shared_from_this(), sender, mailbox);
+            if (!accept_channel_.try_send(std::error_code{}, std::move(conn))) {
+                // `conn` was not taken; its destructor releases the source.
+                continue;
+            }
+        }
+        mailbox->deliver(std::move(datagram));
+    }
+}
+
+asio::awaitable<void> UDPDemux::sweep_loop() {
+    for (;;) {
+        sweep_timer_.expires_after(sweep_interval());
+        asio::error_code ec;
+        co_await sweep_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        if (ec)
+            co_return;                            // cancelled by shut_down_if_unused()
+        const auto cutoff = std::chrono::steady_clock::now() - idle_timeout();
+        while (!lru_.empty() && lru_.back().last_active < cutoff)
+            evict(std::prev(lru_.end()), Mailbox::CloseCause::idle);
+        shut_down_if_unused();
+    }
+}
+
+void UDPDemux::evict(Lru::iterator it, Mailbox::CloseCause cause) {
+    it->mailbox->close(cause);                    // a waiting receive() fails with the cause
+    index_.erase(it->source);
+    lru_.erase(it);
+}
+
+void UDPDemux::shut_down_if_unused() {
+    if (accepting_ || !index_.empty())
+        return;
+    asio::error_code ignored;
+    socket_.close(ignored);                       // ends receive_loop()
+    sweep_timer_.cancel();                        // ends sweep_loop()
+}
+
+asio::awaitable<Result<std::unique_ptr<Connection>>> UDPDemux::accept() {
+    // The channel is not thread-safe: use it from strand_ only, like the receive loop.
+    co_await asio::dispatch(strand_, asio::use_awaitable);
+    auto [ec, conn] = co_await accept_channel_.async_receive(asio::as_tuple(asio::use_awaitable));
+    if (ec)
+        co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INVALID_STATE,
+                                            "Listener stopped"));
+    conn->state_ = ConnectionState::ESTABLISHED;
+    co_return Result<std::unique_ptr<Connection>>(std::move(conn));
+}
+
+void UDPDemux::stop_accepting() {
+    asio::post(strand_, [self = shared_from_this()] {
+        self->accepting_ = false;
+        self->accept_channel_.close();            // a pending accept() fails
+        self->shut_down_if_unused();
+    });
+}
+
+void UDPDemux::release(const asio::ip::udp::endpoint& source, const Mailbox* mailbox) {
+    asio::post(strand_, [self = shared_from_this(), source, mailbox] {
+        auto it = self->index_.find(source);
+        if (it != self->index_.end() && it->second->mailbox.get() == mailbox)
+            self->evict(it->second, Mailbox::CloseCause::owner);
+        self->shut_down_if_unused();
+    });
+}
+
+// ============================================================================
+// UDPListener
+// ============================================================================
+
 UDPListener::UDPListener(
     asio::io_context& ctx,
     LocalEndpoint local,
@@ -61,63 +187,19 @@ UDPListener::UDPListener(
     SecurityParameters security,
     std::shared_ptr<BlockPoolFactory> pool_factory)
 : io_context_(ctx)
-, socket_(ctx)
-, strand_(asio::make_strand(ctx))
-, accept_channel_(io_context_.get_executor(), 100)
-, block_pool_(pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>())
-, sweep_timer_(strand_)
+, demux_(std::make_shared<UDPDemux>(
+      ctx, pool_factory ? pool_factory->make() : std::make_unique<HeapBlockPool>()))
 {
     local_endpoint_       = std::move(local);
     transport_properties_ = std::move(properties);
     security_parameters_  = std::move(security);
 }
 
-UDPListener::~UDPListener() = default;
-
-// --- demux helpers (strand_) -------------------------------------------------
-
-std::shared_ptr<Mailbox>
-UDPListener::touch_or_create(const asio::ip::udp::endpoint& sender, bool& is_new) {
-    const auto now = std::chrono::steady_clock::now();
-
-    if (auto mit = index_.find(sender); mit != index_.end()) {
-        auto node = mit->second;
-        node->last_active = now;
-        lru_.splice(lru_.begin(), lru_, node);   // move to most-recent
-        is_new = false;
-        return node->mailbox;
-    }
-
-    if (index_.size() >= max_connections() && !lru_.empty())
-        evict(std::prev(lru_.end()), Mailbox::CloseCause::displaced);   // drop least-recently-active
-
-    auto mailbox = std::make_shared<Mailbox>(strand_);
-    lru_.push_front(Conn{sender, mailbox, now});
-    index_.emplace(sender, lru_.begin());
-    is_new = true;
-    return mailbox;
+// Existing Connections keep the demultiplexer alive; this only stops accepting.
+UDPListener::~UDPListener() {
+    if (is_listening_)
+        demux_->stop_accepting();
 }
-
-void UDPListener::evict(std::list<Conn>::iterator it, Mailbox::CloseCause cause) {
-    it->mailbox->close(cause);                   // waiting receive() -> closed error
-    index_.erase(it->endpoint);
-    lru_.erase(it);
-}
-
-asio::awaitable<void> UDPListener::sweep_loop() {
-    for (;;) {
-        sweep_timer_.expires_after(sweep_interval());
-        asio::error_code ec;
-        co_await sweep_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
-        if (ec)
-            co_return;                           // cancelled by stop()
-        const auto cutoff = std::chrono::steady_clock::now() - idle_timeout();
-        while (!lru_.empty() && lru_.back().last_active < cutoff)
-            evict(std::prev(lru_.end()), Mailbox::CloseCause::idle);
-    }
-}
-
-// --- listen ----------------------------------------------------------------
 
 asio::awaitable<Result<void>> UDPListener::listen() {
     try {
@@ -127,73 +209,11 @@ asio::awaitable<Result<void>> UDPListener::listen() {
                 TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::RESOLUTION_FAILED,
                          "Failed to resolve local endpoint"));
         }
-
-        asio::ip::udp::endpoint udp_ep(endpoints[0].address(), endpoints[0].port());
-
-        socket_.open(udp_ep.protocol());
-        socket_.set_option(asio::ip::udp::socket::reuse_address(true));
-        socket_.bind(udp_ep);
-
+        auto started = demux_->start(asio::ip::udp::endpoint(endpoints[0].address(), endpoints[0].port()));
+        if (!started)
+            co_return started;
         is_listening_ = true;
-
-        // Receive loop and idle sweep both run on strand_, so the demux table and
-        // every Mailbox are single-threaded with no locking.
-        asio::co_spawn(
-            strand_,
-            [this]() -> asio::awaitable<void> {
-                asio::ip::udp::endpoint sender;
-
-                for (;;) {
-                    BlockRef block = block_pool_->acquire();
-                    asio::error_code ec;
-                    std::size_t n = co_await socket_.async_receive_from(
-                        asio::buffer(block.writable_data(), block.capacity_after_begin()),
-                        sender,
-                        asio::redirect_error(asio::use_awaitable, ec));
-
-                    if (ec == asio::error::operation_aborted)
-                        co_return;                // socket closed by stop()
-                    if (ec)
-                        continue;                 // transient receive error
-
-                    auto datagram = std::make_shared<BlockChain>();
-                    if (n > 0) {
-                        block.set_range(0, n);
-                        datagram->append(std::move(block));
-                    }
-
-                    bool is_new = false;
-                    std::shared_ptr<Mailbox> mailbox = touch_or_create(sender, is_new);
-
-                    if (is_new) {
-                        auto conn = std::make_unique<PassiveUDPConnection>(
-                            socket_, sender, mailbox);
-                        conn->on_close_ = [this, sender] {
-                            asio::post(strand_, [this, sender] {
-                                if (auto mit = index_.find(sender); mit != index_.end())
-                                    evict(mit->second, Mailbox::CloseCause::owner);
-                            });
-                        };
-
-                        // Non-blocking: if accept() is not keeping up, drop the new
-                        // source rather than stall the demux for everyone (it can
-                        // reconnect once the app catches up).
-                        if (!accept_channel_.try_send(std::error_code{}, std::move(conn))) {
-                            if (auto mit = index_.find(sender); mit != index_.end())
-                                evict(mit->second, Mailbox::CloseCause::displaced);
-                            continue;
-                        }
-                    }
-
-                    mailbox->deliver(std::move(datagram));
-                }
-            },
-            asio::detached);
-
-        asio::co_spawn(strand_, sweep_loop(), asio::detached);
-
         co_return Result<void>{std::in_place};
-
     } catch (const std::system_error& e) {
         co_return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, e.code()));
     } catch (const std::exception& e) {
@@ -207,24 +227,16 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> UDPListener::accept() {
         co_return std::unexpected(
             TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INVALID_STATE, "Not listening"));
     }
-
-    auto [ec, conn] =
-        co_await accept_channel_.async_receive(asio::as_tuple(asio::use_awaitable));
-
-    if (ec) {
-        co_return std::unexpected(
-            TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INVALID_STATE, "Listener stopped: " + ec.message()));
-    }
-    conn->state_ = ConnectionState::ESTABLISHED;
-    co_return Result<std::unique_ptr<Connection>>(std::move(conn));
+    auto demux = demux_;                          // the Listener may go while this waits
+    co_return co_await demux->accept();
 }
 
+// Stops accepting new sources; the Connections already accepted keep working.
 asio::awaitable<Result<void>> UDPListener::stop() {
-    socket_.close();          // wakes the receive loop with operation_aborted
-    sweep_timer_.cancel();
-    is_listening_ = false;
-    index_.clear();
-    lru_.clear();
+    if (is_listening_) {
+        is_listening_ = false;
+        demux_->stop_accepting();
+    }
     co_return Result<void>{std::in_place};
 }
 
