@@ -79,6 +79,13 @@ static void test_vector_variant() {
     CHECK((*segs.begin()).size() == 4);
 }
 
+// as_bytes() may copy into a buffer the Message keeps, so it is not const; the
+// const ways to read a Message are blocks() and taps::gather().
+template <typename M> concept HasAsBytes = requires(M& m) { m.as_bytes(); };
+template <typename M> concept HasBlocks  = requires(M& m) { m.blocks(); };
+static_assert(HasAsBytes<Message> && !HasAsBytes<const Message>);
+static_assert(HasBlocks<const Message>);
+
 // blocks() is a forward range of spans, usable with range-for and <ranges>.
 static_assert(std::ranges::forward_range<Message::Segments>);
 static_assert(std::ranges::sized_range<Message::Segments>);

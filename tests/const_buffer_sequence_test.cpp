@@ -21,6 +21,7 @@
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <vector>
 
 using namespace taps;
 
@@ -81,6 +82,15 @@ int main() {
     CHECK(roundtrip({bytes(hdr), chain}, hdr + b1 + b2 + b3), "header + chain arrive byte-exact");
     CHECK(roundtrip({{}, chain}, b1 + b2 + b3), "chain alone arrives byte-exact");
     CHECK(roundtrip({bytes(hdr), empty_chain}, hdr), "header + empty chain is the header alone");
+
+    // From a Message, as it is: an owning Message, a view, a received (chain) one.
+    const std::string text = "owning-message";
+    const Message owning(std::vector<std::uint8_t>(text.begin(), text.end()));
+    const Message view = make_message_view(body);
+    const Message received(std::make_shared<BlockChain>(chain_of(pool, {b1, b2, b3})));
+    CHECK(roundtrip({bytes(hdr), owning}, hdr + text), "header + owning Message arrive byte-exact");
+    CHECK(roundtrip({{}, view}, body), "a view Message arrives byte-exact");
+    CHECK(roundtrip({bytes(hdr), received}, hdr + b1 + b2 + b3), "header + received Message arrive byte-exact, from its blocks");
 
     const ConstBufferSequence seq(bytes(hdr), chain);
     CHECK(std::distance(seq.begin(), seq.end()) == 4, "one buffer per non-empty part: header and three blocks");

@@ -427,11 +427,14 @@ public:
     std::size_t size() const noexcept;
     std::size_t length() const noexcept { return size(); }
 
-    // The payload as one contiguous byte range. Cheap for the vector / span
-    // variants; for the chain variant it gathers the blocks once into an internal
-    // buffer and caches the result (not thread-safe). Use blocks() to consume a
-    // chain-backed Message without this copy.
-    std::span<const std::byte> as_bytes() const;
+    // The payload as one contiguous byte range. A view for the vector / span
+    // variants, and for a received Message held in a single block. A received
+    // Message spread over several blocks is copied, on the first call, into a buffer
+    // from the message memory resource, which the Message keeps; this is why the
+    // function is not const, and why two threads must not call it on the same
+    // Message at once. To read a Message without that copy, use blocks() or
+    // taps::gather(), which are const.
+    std::span<const std::byte> as_bytes();
 
     // The payload as its constituent contiguous segments, in order (one segment
     // per pooled block; a single segment for the vector / span variants). Zero
@@ -455,14 +458,14 @@ private:
 
     // Gathers the chain into gathered_ on first call and returns a view of it.
     // Only meaningful when chain_ != nullptr.
-    std::span<const std::byte> ensure_gathered() const;
+    std::span<const std::byte> ensure_gathered();
 
     std::vector<std::uint8_t>          owned_data_;
     std::span<const std::uint8_t>      span_view_;
     std::shared_ptr<const BlockChain>  chain_;
-    mutable std::shared_ptr<std::byte[]> gathered_;           // chain-variant cache
-    mutable std::size_t               gathered_size_ = 0;
-    mutable bool                      gathered_valid_ = false;
+    std::shared_ptr<std::byte[]>       gathered_;             // chain-variant cache
+    std::size_t                       gathered_size_ = 0;
+    bool                              gathered_valid_ = false;
     bool                              owning_;
     bool                              end_of_message_ = true;
     MessageContext                    context_;
@@ -883,7 +886,7 @@ private:
 
 // Gather a Message's payload into the caller's contiguous buffer. `out` must be at
 // least msg.size() bytes; returns the number of bytes written. Performs no
-// allocation of its own (unlike Message::as_bytes(), which caches internally).
+// allocation of its own (unlike Message::as_bytes(), which may copy into a buffer it keeps).
 std::size_t gather(std::span<std::byte> out, const Message& msg);
 
 // Non-owning factory for binary data — caller must keep the source alive through send().

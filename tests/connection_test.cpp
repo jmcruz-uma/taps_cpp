@@ -793,7 +793,7 @@ static asio::awaitable<void> pause(asio::io_context& ctx, int ms) {
 }
 
 static bool one_byte(const Result<Message>& r, std::uint8_t b) {
-    return r && r->size() == 1 && std::to_integer<std::uint8_t>(r->as_bytes()[0]) == b;
+    return r && r->size() == 1 && std::to_integer<std::uint8_t>((*r->blocks().begin())[0]) == b;
 }
 
 static void test_udp_connection_outlives_listener() {

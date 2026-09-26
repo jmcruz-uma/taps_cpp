@@ -12,7 +12,7 @@ namespace taps {
 // Definitions that need the complete BlockChain type live here; the public header
 // only forward-declares it so the block substrate stays private to src/.
 
-std::span<const std::byte> Message::ensure_gathered() const {
+std::span<const std::byte> Message::ensure_gathered() {
     // A record that arrived wholly inside one pooled block is already contiguous:
     // view it in place (the block stays alive as long as chain_, i.e. as long as
     // this Message) instead of paying a second copy into a fresh allocation.
@@ -42,7 +42,7 @@ std::size_t Message::size() const noexcept {
     return span_view_.size();
 }
 
-std::span<const std::byte> Message::as_bytes() const {
+std::span<const std::byte> Message::as_bytes() {
     if (chain_)  return ensure_gathered();
     if (owning_) return std::as_bytes(std::span<const std::uint8_t>(owned_data_));
     return std::as_bytes(span_view_);
@@ -64,12 +64,12 @@ std::span<const std::byte> Message::segment(std::size_t i) const noexcept {
 
 // Free function: gather into the caller's buffer, no internal allocation.
 std::size_t gather(std::span<std::byte> out, const Message& msg) {
-    if (const BlockChain* ch = msg.block_chain())
-        return ch->copy_to(out.first(msg.size()));   // walk blocks, no cache touched
-
-    const auto s = msg.as_bytes();                    // vector / span: a cheap view
-    std::memcpy(out.data(), s.data(), s.size());
-    return s.size();
+    std::size_t off = 0;
+    for (const auto segment : msg.blocks()) {          // no cache touched
+        std::memcpy(out.data() + off, segment.data(), segment.size());
+        off += segment.size();
+    }
+    return off;
 }
 
 }  // namespace taps

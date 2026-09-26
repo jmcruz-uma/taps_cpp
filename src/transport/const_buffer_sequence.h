@@ -1,6 +1,7 @@
 #pragma once
 
 #include "buffer/block_chain.h"
+#include "taps/taps_api.h"   // Message
 
 #include <asio/buffer.hpp>
 
@@ -21,6 +22,12 @@ public:
         : header_(header), body_(body) {}
     ConstBufferSequence(std::span<const std::byte> header, const BlockChain& chain) noexcept
         : header_(header), chain_(&chain) {}
+    // A Message as it is: its blocks if it was received, its one segment otherwise.
+    ConstBufferSequence(std::span<const std::byte> header, const Message& message) noexcept
+        : header_(header), chain_(message.block_chain()) {
+        if (!chain_)
+            body_ = *message.blocks().begin();
+    }
 
     class const_iterator {
     public:

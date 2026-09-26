@@ -79,9 +79,7 @@ namespace taps {
             hn = framer_->write_header(message, hdr);
         }
         const std::span<const std::byte> header(hdr.data(), hn);
-        const BlockChain* chain = message.block_chain();
-        const ConstBufferSequence buffers = chain ? ConstBufferSequence(header, *chain)
-                                                  : ConstBufferSequence(header, message.as_bytes());
+        const ConstBufferSequence buffers(header, message);
 
         auto [ec, n] = co_await stream_->write(buffers);
         if (ec) {

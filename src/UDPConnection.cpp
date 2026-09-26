@@ -4,6 +4,7 @@
 #include "buffer/block_chain.h"
 #include "buffer/message_block_pool.h"
 #include "transport/io_error.h"
+#include "transport/const_buffer_sequence.h"
 #include "udp_demux.h"
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -73,16 +74,14 @@ PassiveUDPConnection::send(const Message& message) {
         co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::INVALID_STATE,
                                             "Connection is closed"));
     }
-    const auto body = message.as_bytes();
+    // Header + the Message as it is (a received one is sent from its blocks).
     std::array<std::byte, 64> hdr;
     std::size_t hn = 0;
     if (framer_) {
         assert(framer_->max_header_size() <= hdr.size());
         hn = framer_->write_header(message, hdr);
     }
-    const std::array<asio::const_buffer, 2> iov{
-        asio::buffer(hdr.data(), hn),
-        asio::buffer(body.data(), body.size())};
+    const ConstBufferSequence iov(std::span<const std::byte>(hdr.data(), hn), message);
     auto [ec, n] = co_await demux_->socket().async_send_to(iov, remote_endpoint_,
                                                           asio::as_tuple(asio::use_awaitable));
     if (ec)
@@ -181,21 +180,19 @@ asio::awaitable<Result<void>> ActiveUDPConnection::send(const Message& message) 
                                             "Connection not established"));
     }
     
-    const auto body = message.as_bytes();
+    // Header + the Message as it is (a received one is sent from its blocks).
     std::array<std::byte, 64> hdr;
     std::size_t hn = 0;
     if (framer_) {
         assert(framer_->max_header_size() <= hdr.size());
         hn = framer_->write_header(message, hdr);
     }
-    const std::array<asio::const_buffer, 2> iov{
-        asio::buffer(hdr.data(), hn),
-        asio::buffer(body.data(), body.size())};
+    const ConstBufferSequence iov(std::span<const std::byte>(hdr.data(), hn), message);
     auto [ec, bytes_sent] = co_await socket_.async_send_to(iov, remote_endpoint_,
                                                            asio::as_tuple(asio::use_awaitable));
     if (ec)
         co_return std::unexpected(udp_failure(ErrorEvent::SEND_ERROR, ec, aborted_));
-    if (bytes_sent != hn + body.size())
+    if (bytes_sent != hn + message.size())
         co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::PROTOCOL_FAILED,
                                             "Partial send occurred"));
     co_return std::expected<void, TAPSError>{std::in_place};
