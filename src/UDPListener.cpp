@@ -213,6 +213,11 @@ UDPListener::~UDPListener() {
 }
 
 asio::awaitable<Result<void>> UDPListener::listen() {
+    // No security protocol for datagrams here: requested security cannot be
+    // fulfilled for listening (RFC 9622 Section 7.2), rather than silently not applied.
+    if (security_parameters_.is_enabled())
+        co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::NO_CANDIDATES,
+                                            "security was requested, but no available protocol secures an unreliable transport"));
     try {
         auto endpoints = co_await local_endpoint_.resolve(io_context_);
         if (endpoints.empty()) {

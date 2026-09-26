@@ -363,6 +363,28 @@ static asio::awaitable<void> stop_with_pending_accept(asio::io_context& ctx, std
     co_await t.async_wait(asio::use_awaitable);
 }
 
+// Security requested over UDP (no security protocol for datagrams here) is an
+// EstablishmentError, not plaintext.
+static TransportProperties udp_props() {
+    TransportProperties p;
+    p.set(PropertyKey::RELIABILITY, SelectionProperty::AVOID);
+    return p;
+}
+
+static asio::awaitable<void> udp_with_security(asio::io_context& ctx) {
+    TransportServices ts(ctx);
+    auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", 19969}, udp_props(), server_params());
+    CHECK(!lr && lr.error().event() == ErrorEvent::ESTABLISHMENT_ERROR &&
+              lr.error().reason() == ErrorReason::NO_CANDIDATES,
+          "UDP listen with security: ESTABLISHMENT_ERROR / NO_CANDIDATES");
+    auto pc = ts.preconnect(LocalEndpoint{}, RemoteEndpoint{"127.0.0.1", 19969},
+                            udp_props(), client_params(path("ca.crt")));
+    auto cr = co_await pc.initiate();
+    CHECK(!cr && cr.error().event() == ErrorEvent::ESTABLISHMENT_ERROR &&
+              cr.error().reason() == ErrorReason::NO_CANDIDATES,
+          "UDP initiate with security: ESTABLISHMENT_ERROR / NO_CANDIDATES");
+}
+
 // Client that pins the wrong anchor (the leaf itself) must fail the handshake.
 static asio::awaitable<void> bad_anchor_client(asio::io_context& ctx, std::uint16_t port) {
     TransportServices ts(ctx);
@@ -496,6 +518,14 @@ int main() {
     scenario([](asio::io_context& c) {
         co_spawn(c, [&c]() -> asio::awaitable<void> {
             co_await stop_with_pending_accept(c, 19979);
+            g_client_done = true;
+            c.stop();
+        }, fail_on_exception);
+    });
+
+    scenario([](asio::io_context& c) {
+        co_spawn(c, [&c]() -> asio::awaitable<void> {
+            co_await udp_with_security(c);
             g_client_done = true;
             c.stop();
         }, fail_on_exception);

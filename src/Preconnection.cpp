@@ -67,6 +67,12 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> Preconnection::initiate_wit
             co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
         }
     } else {
+        // No security protocol for datagrams here: requested security cannot be
+        // fulfilled (RFC 9622 Section 7.1), rather than silently not applied.
+        if (security_parameters_.is_enabled())
+            co_return std::unexpected(TAPSError(ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::NO_CANDIDATES,
+                                                "security was requested, but no available protocol secures an unreliable transport"));
+
         // UDP: convert the resolved TCP endpoint to a UDP one.
         asio::ip::udp::endpoint udp_endpoint(endpoint.address(), endpoint.port());
 
