@@ -5,7 +5,9 @@
 #include "buffer/message_block_pool.h"
 #include "transport/io_error.h"
 #include "udp_demux.h"
+#include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
+#include <asio/dispatch.hpp>
 #include <asio/use_awaitable.hpp>
 #include <algorithm>
 #include <array>
@@ -29,10 +31,10 @@ TAPSError cancelled(ErrorEvent event, bool aborted) {
 
 // A socket failure during send or receive. UDP ends a Connection only on Abort
 // (RFC 9623 Section 10.3), so any other failure concerns this operation only.
-TAPSError udp_failure(ErrorEvent event, const std::system_error& e, bool aborted) {
-    if (e.code() == asio::error::operation_aborted)
+TAPSError udp_failure(ErrorEvent event, const std::error_code& ec, bool aborted) {
+    if (ec == asio::error::operation_aborted)
         return cancelled(event, aborted);
-    return io_error(event, e.code());
+    return io_error(event, ec);
 }
 
 }  // namespace
@@ -71,51 +73,47 @@ PassiveUDPConnection::send(const Message& message) {
         co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::INVALID_STATE,
                                             "Connection is closed"));
     }
-    auto& socket = demux_->socket();
-    try {
-        const auto body = message.as_bytes();
-        if (framer_) {
-            std::array<std::byte, 64> hdr;
-            assert(framer_->max_header_size() <= hdr.size());
-            const std::size_t hn = framer_->write_header(message, hdr);
-            const std::array<asio::const_buffer, 2> iov{
-                asio::buffer(hdr.data(), hn),
-                asio::buffer(body.data(), body.size())};
-            co_await socket.async_send_to(iov, remote_endpoint_, asio::use_awaitable);
-        } else {
-            co_await socket.async_send_to(
-                asio::buffer(body.data(), body.size()), remote_endpoint_,
-                asio::use_awaitable);
-        }
-
-        co_return Result<void>{std::in_place};
-    } catch (const std::system_error& e) {
-        co_return std::unexpected(udp_failure(ErrorEvent::SEND_ERROR, e, aborted_));
-    } catch (const std::exception& e) {
-        co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
+    const auto body = message.as_bytes();
+    std::array<std::byte, 64> hdr;
+    std::size_t hn = 0;
+    if (framer_) {
+        assert(framer_->max_header_size() <= hdr.size());
+        hn = framer_->write_header(message, hdr);
     }
+    const std::array<asio::const_buffer, 2> iov{
+        asio::buffer(hdr.data(), hn),
+        asio::buffer(body.data(), body.size())};
+    auto [ec, n] = co_await demux_->socket().async_send_to(iov, remote_endpoint_,
+                                                          asio::as_tuple(asio::use_awaitable));
+    if (ec)
+        co_return std::unexpected(udp_failure(ErrorEvent::SEND_ERROR, ec, aborted_));
+    co_return Result<void>{std::in_place};
 }
 
 asio::awaitable<Result<Message>>
 PassiveUDPConnection::receive() {
-    try {
+    for (;;) {
+        // The Mailbox belongs to the listener's strand: go there before each look.
+        co_await asio::dispatch(mailbox_->executor(), asio::use_awaitable);
         // One datagram = one single-block chain from the listener's pool; no copy.
-        std::shared_ptr<BlockChain> datagram = co_await mailbox_->receive();
-        co_return Message(std::move(datagram), MessageContext{}, /*end_of_message=*/true);
-    } catch (const std::system_error&) {
-        state_ = ConnectionState::CLOSED;
-        switch (mailbox_->close_cause()) {
-            case Mailbox::CloseCause::idle:
-                co_return std::unexpected(TAPSError(ErrorEvent::CONNECTION_ERROR, ErrorReason::IDLE_TIMEOUT,
-                                                    "no traffic from the peer within the idle timeout"));
-            case Mailbox::CloseCause::displaced:
-                co_return std::unexpected(TAPSError(ErrorEvent::CONNECTION_ERROR, ErrorReason::RESOURCE_EXHAUSTED,
-                                                    "evicted: the listener's connection table is full"));
-            case Mailbox::CloseCause::owner:
-                break;
-        }
-        co_return std::unexpected(cancelled(ErrorEvent::RECEIVE_ERROR, aborted_));
+        if (auto datagram = mailbox_->try_pop())
+            co_return Message(std::move(datagram), MessageContext{}, /*end_of_message=*/true);
+        if (mailbox_->closed())
+            break;
+        co_await mailbox_->wait();
     }
+    state_ = ConnectionState::CLOSED;
+    switch (mailbox_->close_cause()) {
+        case Mailbox::CloseCause::idle:
+            co_return std::unexpected(TAPSError(ErrorEvent::CONNECTION_ERROR, ErrorReason::IDLE_TIMEOUT,
+                                                "no traffic from the peer within the idle timeout"));
+        case Mailbox::CloseCause::displaced:
+            co_return std::unexpected(TAPSError(ErrorEvent::CONNECTION_ERROR, ErrorReason::RESOURCE_EXHAUSTED,
+                                                "evicted: the listener's connection table is full"));
+        case Mailbox::CloseCause::owner:
+            break;
+    }
+    co_return std::unexpected(cancelled(ErrorEvent::RECEIVE_ERROR, aborted_));
 }
 
 asio::awaitable<Result<void>>
@@ -183,33 +181,24 @@ asio::awaitable<Result<void>> ActiveUDPConnection::send(const Message& message) 
                                             "Connection not established"));
     }
     
-    try {
-        const auto body = message.as_bytes();
-        std::array<std::byte, 64> hdr;
-        std::size_t hn = 0;
-        if (framer_) {
-            assert(framer_->max_header_size() <= hdr.size());
-            hn = framer_->write_header(message, hdr);
-        }
-        const std::array<asio::const_buffer, 2> iov{
-            asio::buffer(hdr.data(), hn),
-            asio::buffer(body.data(), body.size())};
-
-        const std::size_t bytes_sent = co_await socket_.async_send_to(
-            iov, remote_endpoint_, asio::use_awaitable);
-
-        if (bytes_sent != hn + body.size()) {
-            co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::PROTOCOL_FAILED,
-                                                "Partial send occurred"));
-        }
-
-        co_return std::expected<void, TAPSError>{std::in_place};
-        
-    } catch (const std::system_error& e) {
-        co_return std::unexpected(udp_failure(ErrorEvent::SEND_ERROR, e, aborted_));
-    } catch (const std::exception& e) {
-        co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
+    const auto body = message.as_bytes();
+    std::array<std::byte, 64> hdr;
+    std::size_t hn = 0;
+    if (framer_) {
+        assert(framer_->max_header_size() <= hdr.size());
+        hn = framer_->write_header(message, hdr);
     }
+    const std::array<asio::const_buffer, 2> iov{
+        asio::buffer(hdr.data(), hn),
+        asio::buffer(body.data(), body.size())};
+    auto [ec, bytes_sent] = co_await socket_.async_send_to(iov, remote_endpoint_,
+                                                           asio::as_tuple(asio::use_awaitable));
+    if (ec)
+        co_return std::unexpected(udp_failure(ErrorEvent::SEND_ERROR, ec, aborted_));
+    if (bytes_sent != hn + body.size())
+        co_return std::unexpected(TAPSError(ErrorEvent::SEND_ERROR, ErrorReason::PROTOCOL_FAILED,
+                                            "Partial send occurred"));
+    co_return std::expected<void, TAPSError>{std::in_place};
 }
 
 asio::awaitable<Result<Message>> ActiveUDPConnection::receive() {
@@ -219,31 +208,25 @@ asio::awaitable<Result<Message>> ActiveUDPConnection::receive() {
     }
     
 
-    try {
-        // Read straight into a pooled block; deliver the datagram as a
-        // single-block chain, recycled when the Message is dropped. No copy.
-        BlockRef block = block_pool_->acquire();
-        if (!block)
-            co_return std::unexpected(TAPSError(ErrorEvent::RECEIVE_ERROR, ErrorReason::RESOURCE_EXHAUSTED,
-                                                "receive block pool exhausted"));
-        asio::ip::udp::endpoint sender_endpoint;
+    // Read straight into a pooled block; deliver the datagram as a single-block
+    // chain, recycled when the Message is dropped. No copy.
+    BlockRef block = block_pool_->acquire();
+    if (!block)
+        co_return std::unexpected(TAPSError(ErrorEvent::RECEIVE_ERROR, ErrorReason::RESOURCE_EXHAUSTED,
+                                            "receive block pool exhausted"));
+    asio::ip::udp::endpoint sender_endpoint;
+    auto [ec, n] = co_await socket_.async_receive_from(
+        asio::buffer(block.writable_data(), block.capacity_after_begin()),
+        sender_endpoint, asio::as_tuple(asio::use_awaitable));
+    if (ec)
+        co_return std::unexpected(udp_failure(ErrorEvent::RECEIVE_ERROR, ec, aborted_));
 
-        const std::size_t n = co_await socket_.async_receive_from(
-            asio::buffer(block.writable_data(), block.capacity_after_begin()),
-            sender_endpoint, asio::use_awaitable);
-
-        auto chain = make_chain(block_pool_->resource());
-        if (n > 0) {
-            block.set_range(0, n);
-            chain->append(std::move(block));
-        }
-        co_return Message(std::move(chain), MessageContext{}, /*end_of_message=*/true);
-
-    } catch (const std::system_error& e) {
-        co_return std::unexpected(udp_failure(ErrorEvent::RECEIVE_ERROR, e, aborted_));
-    } catch (const std::exception& e) {
-        co_return std::unexpected(TAPSError(ErrorEvent::RECEIVE_ERROR, ErrorReason::INTERNAL_ERROR, e.what()));
+    auto chain = make_chain(block_pool_->resource());
+    if (n > 0) {
+        block.set_range(0, n);
+        chain->append(std::move(block));
     }
+    co_return Message(std::move(chain), MessageContext{}, /*end_of_message=*/true);
 }
 
 asio::awaitable<Result<void>> ActiveUDPConnection::close() {

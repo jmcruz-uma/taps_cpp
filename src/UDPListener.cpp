@@ -58,12 +58,16 @@ UDPDemux::UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool
 UDPDemux::~UDPDemux() = default;
 
 Result<void> UDPDemux::start(const asio::ip::udp::endpoint& local) {
-    try {
-        socket_.open(local.protocol());
-        socket_.set_option(asio::ip::udp::socket::reuse_address(true));
-        socket_.bind(local);
-    } catch (const std::system_error& e) {
-        return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, e.code()));
+    asio::error_code ec;
+    socket_.open(local.protocol(), ec);
+    if (!ec)
+        socket_.set_option(asio::ip::udp::socket::reuse_address(true), ec);
+    if (!ec)
+        socket_.bind(local, ec);
+    if (ec) {
+        asio::error_code ignored;
+        socket_.close(ignored);
+        return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, ec));
     }
     // Each coroutine holds a reference until the socket closes or the timer is
     // cancelled (shut_down_if_unused()).
@@ -115,7 +119,7 @@ asio::awaitable<void> UDPDemux::receive_loop() {
                 continue;                         // no Listener: no new Connections
             if (index_.size() >= max_connections() && !lru_.empty())
                 evict(std::prev(lru_.end()), Mailbox::CloseCause::displaced);
-            mailbox = std::make_shared<Mailbox>(strand_);
+            mailbox = std::make_shared<Mailbox>(strand_, pool_->resource());
             lru_.push_front(Entry{sender, mailbox, now});
             index_.emplace(sender, lru_.begin());
 

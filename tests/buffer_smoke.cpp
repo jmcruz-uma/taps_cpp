@@ -5,6 +5,10 @@
 #include "buffer/block_chain.h"
 #include "buffer/message_block_pool.h"
 #include "taps/taps_api.h"
+#include "taps/mailbox.h"
+
+#include <asio/io_context.hpp>
+#include <deque>
 
 #include <algorithm>
 #include <cstddef>
@@ -391,6 +395,46 @@ static void test_chain_against_model() {
     CHECK(res.outstanding() == 0);
 }
 
+// The Mailbox ring against a model: deliveries and pops interleaved at random, with
+// growth from empty and drop-oldest at the bound; order, drop count and storage
+// returned to the resource.
+static void test_mailbox_against_model() {
+    CountingResource res;
+    {
+        asio::io_context io;
+        constexpr std::size_t kBound = 64;          // growth 4 → 8 → 16 → 32 → 64
+        Mailbox mailbox(io.get_executor(), &res, kBound);
+        std::deque<const BlockChain*> model;
+        std::vector<std::shared_ptr<BlockChain>> tags(20000);
+        std::size_t next = 0, dropped = 0;
+        std::uint32_t rng = 777;
+        auto rand = [&rng] { rng = rng * 1103515245u + 12345u; return (rng >> 16) & 0x7fffu; };
+        bool same = true;
+        for (int step = 0; step < 20000 && next < tags.size(); ++step) {
+            if (rand() % 3 != 0) {                    // deliver (twice as likely as pop)
+                tags[next] = std::make_shared<BlockChain>();
+                mailbox.deliver(tags[next]);
+                if (model.size() == kBound) { model.pop_front(); ++dropped; }
+                model.push_back(tags[next].get());
+                ++next;
+            } else {
+                auto d = mailbox.try_pop();
+                const BlockChain* want = model.empty() ? nullptr : model.front();
+                if (!model.empty()) model.pop_front();
+                same = same && d.get() == want;
+            }
+        }
+        CHECK(same);
+        CHECK(mailbox.dropped() == dropped);
+        while (!model.empty()) {
+            same = same && mailbox.try_pop().get() == model.front();
+            model.pop_front();
+        }
+        CHECK(same && !mailbox.try_pop());
+    }
+    CHECK(res.outstanding() == 0);
+}
+
 int main() {
     test_pool_acquire_release();
     test_recycling_by_pool_resource();
@@ -405,6 +449,7 @@ int main() {
     test_chain_overflow_copy_move();
     test_make_chain_from_resource();
     test_chain_against_model();
+    test_mailbox_against_model();
 
     if (g_failures == 0) {
         std::printf("buffer_smoke: OK\n");

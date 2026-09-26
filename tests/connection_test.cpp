@@ -960,6 +960,49 @@ static void test_udp_receive_before_send() {
     check_finished(finished, "udp receive before send test");
 }
 
+// A passive UDP Connection keeps the newest datagrams when its bounded queue
+// fills (drop-oldest, counted), and delivers them in order.
+static void test_udp_passive_queue_drops_oldest() {
+    constexpr std::uint16_t port = 19964;
+    constexpr std::uint16_t kSent = 300, kBound = 256;
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp queue: listen"); co_return; }
+        auto listener = std::move(*lr);
+        asio::ip::udp::socket peer(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+        for (std::uint16_t i = 0; i < kSent; ++i) {
+            const std::uint8_t d[2] = {static_cast<std::uint8_t>(i >> 8), static_cast<std::uint8_t>(i)};
+            co_await peer.async_send_to(asio::buffer(d), {asio::ip::make_address("127.0.0.1"), port},
+                                        asio::use_awaitable);
+            if (i % 50 == 49) co_await pause(ctx, 5);   // let the listener drain the socket
+        }
+        co_await pause(ctx, 50);
+        auto ar = co_await listener->accept();
+        if (!ar) { CHECK(false, "udp queue: accept"); co_return; }
+        auto* passive = dynamic_cast<PassiveUDPConnection*>(ar->get());
+        bool in_order = true;
+        for (std::uint16_t expected = kSent - kBound; expected < kSent; ++expected) {
+            auto r = co_await (*ar)->receive();
+            const auto b = r ? r->as_bytes() : std::span<const std::byte>{};
+            const std::uint16_t got = b.size() == 2
+                ? static_cast<std::uint16_t>((std::to_integer<unsigned>(b[0]) << 8) | std::to_integer<unsigned>(b[1]))
+                : 0xffff;
+            in_order = in_order && got == expected;
+        }
+        CHECK(passive && passive->datagrams_dropped() == kSent - kBound && in_order,
+              "udp: a full passive queue drops the oldest datagrams, counts them, and keeps the newest in order");
+        co_await (*ar)->close();
+        co_await listener->stop();
+        co_await pause(ctx, 50);
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(10));
+    check_finished(finished, "udp queue test");
+}
+
 int main() {
     test_unframed_stream();
     test_framed_records();
@@ -981,6 +1024,7 @@ int main() {
     test_udp_echo();
     test_udp_idle_eviction();
     test_udp_receive_before_send();
+    test_udp_passive_queue_drops_oldest();
     test_udp_connection_outlives_listener();
     test_udp_listener_stop();
     test_udp_source_after_connection_destroyed();
