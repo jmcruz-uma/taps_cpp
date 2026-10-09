@@ -64,6 +64,8 @@ Result<void> UDPDemux::start(const asio::ip::udp::endpoint& local) {
         socket_.set_option(asio::ip::udp::socket::reuse_address(true), ec);
     if (!ec)
         socket_.bind(local, ec);
+    if (!ec)
+        local_ = socket_.local_endpoint(ec);
     if (ec) {
         asio::error_code ignored;
         socket_.close(ignored);

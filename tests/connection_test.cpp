@@ -814,9 +814,16 @@ static void test_udp_connection_outlives_listener() {
         if (!ar) { CHECK(false, "udp outlives listener: accept"); co_return; }
         auto conn = std::move(*ar);
         auto first = co_await conn->receive();
+        auto on_port = [&conn] {
+            const auto local = conn->get_local_endpoint();
+            return local.hostname() == "127.0.0.1" && local.port() == port;
+        };
+        const bool local_before = on_port();
 
         listener.reset();                 // destroyed without stop(), receive loop pending
         co_await pause(ctx, 50);
+        CHECK(local_before && on_port(),
+              "udp: a passive connection's local endpoint is the Listener's, also after the Listener is destroyed");
 
         co_await udp_send_byte(peer, port, 'b');
         auto second = co_await conn->receive();

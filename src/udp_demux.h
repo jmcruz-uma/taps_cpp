@@ -71,8 +71,9 @@ public:
     asio::awaitable<std::tuple<std::error_code, std::size_t>>
     send_to(const ConstBufferSequence& datagram, const asio::ip::udp::endpoint& to);
 
-    // The shared socket, for its local endpoint; sends go through send_to().
-    asio::ip::udp::socket& socket() noexcept { return socket_; }
+    // The endpoint the socket is bound to, recorded by start(): callers on any
+    // thread read it without touching the socket.
+    const asio::ip::udp::endpoint& local_endpoint() const noexcept { return local_; }
 
 private:
     struct Entry {
@@ -89,6 +90,7 @@ private:
     void shut_down_if_unused();
 
     asio::ip::udp::socket socket_;
+    asio::ip::udp::endpoint local_;
     asio::strand<asio::io_context::executor_type> strand_;
     std::unique_ptr<MessageBlockPool> pool_;   // one block per datagram
     asio::steady_timer sweep_timer_;

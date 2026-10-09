@@ -140,10 +140,7 @@ PassiveUDPConnection::get_remote_endpoint() const {
 
 LocalEndpoint
 PassiveUDPConnection::get_local_endpoint() const {
-    asio::error_code ec;
-    const auto local = demux_->socket().local_endpoint(ec);
-    if (ec)
-        return LocalEndpoint{};
+    const auto& local = demux_->local_endpoint();
     return LocalEndpoint(local.address().to_string(), local.port());
 }
 
