@@ -174,6 +174,12 @@ asio::awaitable<Result<std::unique_ptr<Connection>>> UDPDemux::accept() {
     co_return Result<std::unique_ptr<Connection>>(std::move(conn));
 }
 
+asio::awaitable<std::tuple<std::error_code, std::size_t>>
+UDPDemux::send_to(const ConstBufferSequence& datagram, const asio::ip::udp::endpoint& to) {
+    co_await asio::dispatch(strand_, asio::use_awaitable);
+    co_return co_await socket_.async_send_to(datagram, to, asio::as_tuple(asio::use_awaitable));
+}
+
 void UDPDemux::stop_accepting() {
     asio::post(strand_, [self = shared_from_this()] {
         self->accepting_ = false;

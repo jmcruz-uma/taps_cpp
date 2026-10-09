@@ -86,8 +86,7 @@ PassiveUDPConnection::send(const Message& message) {
         hn = framer_->write_header(message, hdr);
     }
     const ConstBufferSequence iov(std::span<const std::byte>(hdr.data(), hn), message);
-    auto [ec, n] = co_await demux_->socket().async_send_to(iov, remote_endpoint_,
-                                                          asio::as_tuple(asio::use_awaitable));
+    auto [ec, n] = co_await demux_->send_to(iov, remote_endpoint_);
     if (ec)
         co_return std::unexpected(udp_failure(ErrorEvent::SEND_ERROR, ec, aborted_));
     co_return Result<void>{std::in_place};

@@ -5,8 +5,9 @@
 // (chain-backed) Messages, receive-pool exhaustion, a pending receive() interrupted
 // by abort(), replying after the peer's end of stream, close() with unread data or
 // a pending receive(), abort() as a reset, establishment and listen errors, UDP
-// datagram echo, UDP idle eviction, and the UDP Listener's lifetime (passive
-// Connections outlive it; stop() only stops accepting new sources). Errors are checked as RFC 9622 event + RFC 9623 Appendix B reason.
+// datagram echo, UDP idle eviction, the UDP Listener's lifetime (passive
+// Connections outlive it; stop() only stops accepting new sources), and concurrent
+// sends of several passive UDP Connections from several threads. Errors are checked as RFC 9622 event + RFC 9623 Appendix B reason.
 
 #include "taps/taps_api.h"
 #include "taps/message_framer.h"
@@ -14,6 +15,7 @@
 #include <asio.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +25,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -934,6 +937,95 @@ static void test_udp_source_after_connection_destroyed() {
     check_finished(finished, "udp new connection test");
 }
 
+// Several passive Connections of one Listener sending at once, from several threads,
+// on the shared socket: every datagram reaches its own peer, intact and in order.
+// Each peer acknowledges a batch before the next, so no datagram is lost to a full
+// receive buffer.
+static void test_udp_concurrent_passive_sends() {
+    constexpr std::uint16_t port = 19965;
+    constexpr std::size_t kPeers = 4, kRounds = 50, kBatch = 32, kThreads = 4;
+    using udp = asio::ip::udp;
+    asio::io_context ctx;
+    std::atomic<std::size_t> ended{0};             // senders and peers that reached their end
+    std::atomic<std::size_t> errors{0};
+    bool finished = false;
+
+    // Datagram j of Connection i: {i, j}.
+    auto sender = [&](Connection* conn, std::uint32_t i) -> asio::awaitable<void> {
+        if (!co_await conn->receive()) { ++errors; co_return; }   // the peer's hello
+        std::uint32_t j = 0;
+        for (std::size_t r = 0; r < kRounds; ++r) {
+            for (std::size_t b = 0; b < kBatch; ++b, ++j) {
+                const std::array<std::uint32_t, 2> d{i, j};
+                auto bytes = std::as_bytes(std::span(d));
+                if (!co_await conn->send(make_message_view(std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size())))) {
+                    ++errors; co_return;
+                }
+            }
+            if (!one_byte(co_await conn->receive(), 'k')) { ++errors; co_return; }
+        }
+        ++ended;
+    };
+    auto peer_loop = [&](udp::socket& peer, std::uint32_t i) -> asio::awaitable<void> {
+        std::uint32_t expected = 0;
+        for (std::size_t r = 0; r < kRounds; ++r) {
+            for (std::size_t b = 0; b < kBatch; ++b, ++expected) {
+                std::array<std::uint32_t, 2> d{};
+                udp::endpoint from;
+                auto [ec, n] = co_await peer.async_receive_from(asio::buffer(d), from,
+                                                                asio::as_tuple(asio::use_awaitable));
+                if (ec || n != sizeof d || d[0] != i || d[1] != expected) { ++errors; co_return; }
+            }
+            co_await udp_send_byte(peer, port, 'k');
+        }
+        ++ended;
+    };
+
+    asio::co_spawn(ctx, [&]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp concurrent sends: listen"); co_return; }
+        auto listener = std::move(*lr);
+        std::vector<std::unique_ptr<udp::socket>> peers;
+        for (std::size_t i = 0; i < kPeers; ++i) {
+            peers.push_back(std::make_unique<udp::socket>(ctx, udp::endpoint(udp::v4(), 0)));
+            co_await udp_send_byte(*peers.back(), port, 'h');
+        }
+        std::vector<std::unique_ptr<Connection>> conns;
+        for (std::size_t i = 0; i < kPeers; ++i) {
+            auto ar = co_await listener->accept();
+            if (!ar) { CHECK(false, "udp concurrent sends: accept"); co_return; }
+            conns.push_back(std::move(*ar));
+        }
+        // Connection i talks to the peer on the same port.
+        for (auto& conn : conns) {
+            const auto remote = conn->get_remote_endpoint().port();
+            std::uint32_t i = 0;
+            while (i < kPeers && peers[i]->local_endpoint().port() != remote) ++i;
+            if (i == kPeers) { CHECK(false, "udp concurrent sends: match peers"); co_return; }
+            asio::co_spawn(ctx, peer_loop(*peers[i], i), fail_on_exception);
+            asio::co_spawn(ctx, sender(conn.get(), i), fail_on_exception);
+        }
+        while (ended < 2 * kPeers && errors == 0)
+            co_await pause(ctx, 10);
+        CHECK(ended == 2 * kPeers && errors == 0,
+              "udp: concurrent sends of several passive connections each reach their peer, intact and in order");
+        for (auto& conn : conns)
+            co_await conn->close();
+        co_await listener->stop();
+        co_await pause(ctx, 50);
+        finished = true;
+        ctx.stop();
+    }, fail_on_exception);
+    std::vector<std::thread> threads;
+    for (std::size_t t = 0; t < kThreads; ++t)
+        threads.emplace_back([&ctx] { ctx.run_for(std::chrono::seconds(20)); });
+    for (auto& t : threads)
+        t.join();
+    check_finished(finished, "udp concurrent sends test");
+}
+
 // An active UDP Connection reserves its local port at initiate (RFC 9623 Section
 // 10.3): it can receive before it has sent anything.
 static void test_udp_receive_before_send() {
@@ -1059,6 +1151,7 @@ int main() {
     test_udp_connection_outlives_listener();
     test_udp_listener_stop();
     test_udp_source_after_connection_destroyed();
+    test_udp_concurrent_passive_sends();
 
     if (g_failures == 0) {
         std::printf("connection_test: all checks passed\n");

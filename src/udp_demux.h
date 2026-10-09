@@ -2,6 +2,7 @@
 
 #include "taps/taps_api.h"
 #include "taps/mailbox.h"
+#include "transport/const_buffer_sequence.h"
 
 #include <asio/experimental/channel.hpp>
 #include <asio/io_context.hpp>
@@ -10,8 +11,11 @@
 #include <asio/strand.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <list>
 #include <memory>
+#include <system_error>
+#include <tuple>
 #include <unordered_map>
 
 namespace taps {
@@ -37,7 +41,8 @@ class MessageBlockPool;
 // than the idle timeout. This keeps memory bounded under a spoofed-source flood
 // without attempting address validation (out of scope).
 //
-// The table, every Mailbox and the accept channel are touched only on strand_.
+// The table, every Mailbox, the accept channel and the socket's asynchronous
+// operations are touched only on strand_.
 // ============================================================================
 class UDPDemux : public std::enable_shared_from_this<UDPDemux> {
 public:
@@ -57,12 +62,16 @@ public:
     // source leaves the table, so a later datagram from it creates a new one.
     void release(const asio::ip::udp::endpoint& source, const Mailbox* mailbox);
 
-    // The shared socket. Every PassiveUDPConnection of the Listener sends on it,
-    // from its own coroutine (on any thread), while receive_loop() reads on strand_.
-    // asio guarantees concurrent use of one socket object only for its synchronous
-    // operations; for the asynchronous ones used here this relies on the Linux epoll
-    // backend, which locks each descriptor's operation queues. Sending through
-    // strand_ would make it a guarantee, at the cost of serialising every send.
+    // Sends one datagram to `to` on the shared socket. Every PassiveUDPConnection
+    // of the Listener sends through here, from its own coroutine (on any thread).
+    // asio allows one socket object to be used from several threads at once only
+    // for its synchronous operations, so the send starts on strand_, like every
+    // other operation on the socket; several sends may be pending at once, queued
+    // by the socket. `datagram` must stay alive until the send completes.
+    asio::awaitable<std::tuple<std::error_code, std::size_t>>
+    send_to(const ConstBufferSequence& datagram, const asio::ip::udp::endpoint& to);
+
+    // The shared socket, for its local endpoint; sends go through send_to().
     asio::ip::udp::socket& socket() noexcept { return socket_; }
 
 private:
