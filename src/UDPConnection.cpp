@@ -14,8 +14,17 @@
 #include <array>
 #include <bit>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <memory>
+#include <system_error>
+
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <sys/uio.h>
+#endif
 
 namespace taps {
 
@@ -33,9 +42,10 @@ TAPSError cancelled(ErrorEvent event, bool aborted) {
 // A socket failure during send or receive. UDP ends a Connection only on Abort
 // (RFC 9623 Section 10.3), so any other failure concerns this operation only.
 // Not implemented yet: RFC 9623 Section 10.3 reports ICMP errors (e.g. port
-// unreachable) as SoftError events. The sockets here are not connected, and on an
-// unconnected socket Linux does not report ICMP errors by default (IP_RECVERR
-// would be needed), so they are not seen at all.
+// unreachable) as SoftError events. On an unconnected socket Linux does not report
+// them by default (IP_RECVERR would be needed); on a connected one (a passive
+// Connection's own socket) they surface as the error of a later send or receive,
+// which then fails that operation only.
 TAPSError udp_failure(ErrorEvent event, const std::error_code& ec, bool aborted) {
     if (ec == asio::error::operation_aborted)
         return cancelled(event, aborted);
@@ -51,10 +61,14 @@ TAPSError udp_failure(ErrorEvent event, const std::error_code& ec, bool aborted)
 PassiveUDPConnection::PassiveUDPConnection(
     std::shared_ptr<UDPDemux> demux,
     asio::ip::udp::endpoint remote,
-    std::shared_ptr<Mailbox> mailbox)
+    std::shared_ptr<Mailbox> mailbox,
+    std::unique_ptr<asio::ip::udp::socket> socket,
+    const MessageMemoryConfig& memory)
 : demux_(std::move(demux))
 , remote_endpoint_(remote)
 , mailbox_(std::move(mailbox))
+, socket_(std::move(socket))
+, block_pool_(socket_ ? std::make_unique<MessageBlockPool>(memory) : nullptr)
 {
     state_ = ConnectionState::ESTABLISHING;
 }
@@ -86,7 +100,8 @@ PassiveUDPConnection::send(const Message& message) {
         hn = framer_->write_header(message, hdr);
     }
     const ConstBufferSequence iov(std::span<const std::byte>(hdr.data(), hn), message);
-    auto [ec, n] = co_await demux_->send_to(iov, remote_endpoint_);
+    auto [ec, n] = socket_ ? co_await socket_->async_send(iov, asio::as_tuple(asio::use_awaitable))
+                           : co_await demux_->send_to(iov, remote_endpoint_);
     if (ec)
         co_return std::unexpected(udp_failure(ErrorEvent::SEND_ERROR, ec, aborted_));
     co_return Result<void>{std::in_place};
@@ -94,7 +109,14 @@ PassiveUDPConnection::send(const Message& message) {
 
 asio::awaitable<Result<Message>>
 PassiveUDPConnection::receive() {
+    if (socket_ && state_ == ConnectionState::CLOSED)
+        co_return std::unexpected(cancelled(ErrorEvent::RECEIVE_ERROR, aborted_));
     for (;;) {
+        // With a socket of its own, the Mailbox only holds what arrived before the
+        // socket was connected (or, rarely, a late datagram): skip the strand while
+        // it is empty.
+        if (socket_ && mailbox_->queued() == 0)
+            co_return co_await receive_own();
         // The Mailbox belongs to the listener's strand: go there before each look.
         co_await asio::dispatch(mailbox_->executor(), asio::use_awaitable);
         // One datagram = one single-block chain from the listener's pool; no copy.
@@ -102,15 +124,71 @@ PassiveUDPConnection::receive() {
             co_return Message(std::move(datagram), MessageContext{}, /*end_of_message=*/true);
         if (mailbox_->closed())
             break;
-        co_await mailbox_->wait();
+        if (!socket_)
+            co_await mailbox_->wait();
     }
     state_ = ConnectionState::CLOSED;
     co_return std::unexpected(cancelled(ErrorEvent::RECEIVE_ERROR, aborted_));
 }
 
+asio::awaitable<Result<Message>>
+PassiveUDPConnection::receive_own() {
+#if defined(_WIN32)
+    co_return std::unexpected(TAPSError(ErrorEvent::RECEIVE_ERROR, ErrorReason::INTERNAL_ERROR,
+                                        "no socket of its own on this system"));
+#else
+    // Read straight into a pooled block, as an active Connection does; recvmsg()
+    // rather than asio's receive, for the system's count of dropped datagrams.
+    BlockRef block = block_pool_->acquire();
+    if (!block)
+        co_return std::unexpected(TAPSError(ErrorEvent::RECEIVE_ERROR, ErrorReason::RESOURCE_EXHAUSTED,
+                                            "receive block pool exhausted"));
+    for (;;) {
+        iovec iov{block.writable_data(), block.capacity_after_begin()};
+        alignas(cmsghdr) std::array<char, CMSG_SPACE(sizeof(std::uint32_t))> control{};
+        msghdr msg{};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.data();
+        msg.msg_controllen = control.size();
+        const ssize_t n = ::recvmsg(socket_->native_handle(), &msg, MSG_DONTWAIT);
+        if (n >= 0) {
+#if defined(SO_RXQ_OVFL)
+            for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+                if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_RXQ_OVFL) {
+                    std::uint32_t total = 0;
+                    std::memcpy(&total, CMSG_DATA(c), sizeof total);
+                    system_dropped_.store(total, std::memory_order_relaxed);
+                }
+            }
+#endif
+            auto chain = make_chain(block_pool_->resource());
+            if (n > 0) {
+                block.set_range(0, static_cast<std::size_t>(n));
+                chain->append(std::move(block));
+            }
+            co_return Message(std::move(chain), MessageContext{}, /*end_of_message=*/true);
+        }
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            co_return std::unexpected(udp_failure(ErrorEvent::RECEIVE_ERROR,
+                                                  std::error_code(errno, std::system_category()), aborted_));
+        auto [ec] = co_await socket_->async_wait(asio::ip::udp::socket::wait_read,
+                                                 asio::as_tuple(asio::use_awaitable));
+        if (ec)
+            co_return std::unexpected(udp_failure(ErrorEvent::RECEIVE_ERROR, ec, aborted_));
+    }
+#endif
+}
+
 asio::awaitable<Result<void>>
 PassiveUDPConnection::close() {
     state_ = ConnectionState::CLOSED;
+    if (socket_) {
+        asio::error_code ignored;
+        socket_->close(ignored);                // a pending receive() fails
+    }
     release();                                  // a pending receive() fails with INVALID_STATE
     co_return Result<void>{std::in_place};
 }
@@ -135,7 +213,11 @@ PassiveUDPConnection::get_local_endpoint() const {
 }
 
 std::size_t PassiveUDPConnection::datagrams_dropped() const noexcept {
-    return mailbox_ ? mailbox_->dropped() : 0;
+    return (mailbox_ ? mailbox_->dropped() : 0) + system_dropped_.load(std::memory_order_relaxed);
+}
+
+std::size_t PassiveUDPConnection::datagrams_late() const noexcept {
+    return mailbox_ ? mailbox_->late() : 0;
 }
 
 

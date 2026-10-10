@@ -37,11 +37,12 @@ class BlockChain;  // src/buffer/block_chain.h (private) — one datagram per ch
 // usual backlog fits, no datagram allocates. The storage holds references to
 // message data, so it comes from the message memory resource.
 //
-// Everything except dropped() runs on the executor passed to the constructor
-// (the listener strand), so no locking is needed. A receiver goes to that
-// executor, then try_pop(); if nothing is there and the Mailbox is open, it
-// co_awaits wait() and tries again, back on that executor. dropped() may be read
-// from any thread (atomic).
+// Everything except queued(), dropped() and late() runs on the executor passed to
+// the constructor (the listener strand), so no locking is needed. A receiver goes
+// to that executor, then try_pop(); if nothing is there and the Mailbox is open, it
+// co_awaits wait() and tries again, back on that executor. queued(), dropped() and
+// late() may be read from any thread (atomic): queued() lets a Connection with a
+// socket of its own skip the strand while its Mailbox is empty.
 class Mailbox {
 public:
     using value_type = std::shared_ptr<BlockChain>;
@@ -69,6 +70,7 @@ public:
         }
         ring_[(head_ + count_) % ring_.size()] = std::move(datagram);
         ++count_;
+        queued_.store(count_, std::memory_order_release);
         timer_.cancel_one();                                 // wake a waiter, if any
     }
 
@@ -93,11 +95,21 @@ public:
         return dropped_.load(std::memory_order_relaxed);
     }
 
+    // Datagrams waiting; may be read from any thread.
+    std::size_t queued() const noexcept { return queued_.load(std::memory_order_acquire); }
+
+    // Counts a datagram delivered after its Connection had started reading from a
+    // socket of its own (it reached the listener's socket in the instant before
+    // that socket was connected).
+    void count_late() noexcept { late_.fetch_add(1, std::memory_order_relaxed); }
+    std::size_t late() const noexcept { return late_.load(std::memory_order_relaxed); }
+
 private:
     value_type pop_front() noexcept {
         value_type d = std::move(ring_[head_]);
         head_ = (head_ + 1) % ring_.size();
         --count_;
+        queued_.store(count_, std::memory_order_release);
         return d;
     }
 
@@ -118,6 +130,8 @@ private:
     std::size_t                   count_ = 0;
     std::size_t                   capacity_;
     std::atomic<std::size_t>      dropped_{0};
+    std::atomic<std::size_t>      queued_{0};  // mirrors count_ for readers off the executor
+    std::atomic<std::size_t>      late_{0};
     bool                          closed_ = false;
 };
 

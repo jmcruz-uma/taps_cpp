@@ -14,6 +14,7 @@
 #include "taps/message_framer.h"
 
 #include <asio.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
 
 #include <array>
 #include <atomic>
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <memory_resource>
 #include <span>
 #include <string>
 #include <thread>
@@ -997,7 +999,7 @@ static Result<std::unique_ptr<Connection>> not_run() {
 }
 
 static void test_udp_new_connection_limit() {
-    constexpr std::uint16_t port = 19966;
+    constexpr std::uint16_t port = 19951;
     asio::io_context ctx;
     bool finished = false;
     asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
@@ -1039,7 +1041,7 @@ static void test_udp_new_connection_limit() {
 }
 
 static void test_tcp_new_connection_limit() {
-    constexpr std::uint16_t port = 19967;
+    constexpr std::uint16_t port = 19952;
     asio::io_context ctx;
     bool finished = false;
     asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
@@ -1076,14 +1078,187 @@ static void test_tcp_new_connection_limit() {
     check_finished(finished, "tcp new connection limit test");
 }
 
+// Many clients that start at once and send a burst straight away, before they hear
+// anything (the client sends first): every source gets one Connection, and each
+// Connection receives exactly its own datagrams, all of them. This is where the
+// races around a Connection's own socket (other sources' datagrams landing on it
+// before connect(), its own still queued on the listening socket) show up.
+static void test_udp_burst_from_many_new_sources() {
+    constexpr std::uint16_t port = 19953;
+    constexpr std::uint32_t kClients = 16, kBurst = 8;
+    constexpr std::size_t kThreads = 4;
+    using udp = asio::ip::udp;
+    // Several threads receive and hold Messages: a thread-safe message resource,
+    // declared first so that it outlives everything that uses it.
+    std::pmr::synchronized_pool_resource memory(message_pool_options());
+    asio::io_context ctx;
+    std::atomic<std::size_t> ok_conns{0}, errors{0}, late{0};
+    bool finished = false;
+
+    asio::co_spawn(ctx, [&]() -> asio::awaitable<void> {
+        TransportServices ts(ctx, MessageMemoryConfig{&memory});
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp burst: listen"); co_return; }
+        auto listener = std::move(*lr);
+        std::vector<std::unique_ptr<udp::socket>> clients;
+        for (std::uint32_t i = 0; i < kClients; ++i) {
+            clients.push_back(std::make_unique<udp::socket>(ctx, udp::endpoint(udp::v4(), 0)));
+            clients.back()->connect({asio::ip::make_address("127.0.0.1"), port});
+        }
+        // All bursts at once: datagram j of client i is {i, j}.
+        for (std::uint32_t j = 0; j < kBurst; ++j)
+            for (std::uint32_t i = 0; i < kClients; ++i) {
+                const std::array<std::uint32_t, 2> d{i, j};
+                clients[i]->send(asio::buffer(d));
+            }
+
+        std::vector<std::unique_ptr<Connection>> conns;
+        for (std::uint32_t k = 0; k < kClients; ++k) {
+            using namespace asio::experimental::awaitable_operators;
+            asio::steady_timer limit(ctx, std::chrono::seconds(3));
+            auto got = co_await (listener->accept() || limit.async_wait(asio::use_awaitable));
+            if (got.index() == 1 || !std::get<0>(got)) break;
+            conns.push_back(std::move(*std::get<0>(got)));
+        }
+        // Each Connection: its client's kBurst datagrams, every one, then a reply.
+        for (auto& conn : conns) {
+            asio::co_spawn(ctx, [&, c = conn.get()]() -> asio::awaitable<void> {
+                std::vector<bool> seen(kBurst, false);
+                int id = -1;
+                for (std::uint32_t n = 0; n < kBurst; ++n) {
+                    auto r = co_await c->receive();
+                    std::array<std::uint32_t, 2> d{};
+                    if (!r || r->size() != sizeof d) { ++errors; co_return; }
+                    gather(std::as_writable_bytes(std::span(d)), *r);
+                    if (d[0] >= kClients || d[1] >= kBurst || (id >= 0 && d[0] != static_cast<std::uint32_t>(id))
+                        || seen[d[1]]) { ++errors; co_return; }
+                    id = static_cast<int>(d[0]);
+                    seen[d[1]] = true;
+                }
+                if (auto* p = dynamic_cast<PassiveUDPConnection*>(c))
+                    late += p->datagrams_late();
+                const std::uint8_t reply = 'r';
+                if (!co_await c->send(make_message_view(std::span<const std::uint8_t>(&reply, 1)))) { ++errors; co_return; }
+                ++ok_conns;
+            }, fail_on_exception);
+        }
+        for (int t = 0; t < 300 && ok_conns + errors < conns.size(); ++t)
+            co_await pause(ctx, 10);
+        // Every client hears its reply from the listening port.
+        std::size_t replies = 0;
+        for (auto& c : clients) {
+            std::uint8_t b = 0;
+            if (c->available() > 0 && c->receive(asio::buffer(&b, 1)) == 1 && b == 'r')
+                ++replies;
+        }
+        std::printf("      (udp burst: %zu late datagrams)\n", late.load());
+        CHECK(conns.size() == kClients && ok_conns == kClients && errors == 0 && replies == kClients,
+              "udp: a burst from many new sources at once gives each its Connection with all its own datagrams");
+        for (auto& c : conns)
+            co_await c->close();
+        co_await listener->stop();
+        co_await pause(ctx, 50);
+        finished = true;
+        ctx.stop();
+    }, fail_on_exception);
+    std::vector<std::thread> threads;
+    for (std::size_t t = 0; t < kThreads; ++t)
+        threads.emplace_back([&ctx] { ctx.run_for(std::chrono::seconds(20)); });
+    for (auto& t : threads)
+        t.join();
+    check_finished(finished, "udp burst test");
+}
+
+// New sources that keep arriving while the Listener is giving earlier ones their
+// own sockets: a source's first datagram can land on a socket that is bound but
+// not yet connected, and must still give that source its Connection. Every source
+// gets one, with all its own datagrams.
+static void test_udp_new_sources_keep_arriving() {
+    constexpr std::uint16_t port = 19954;
+    constexpr std::uint32_t kClients = 400, kEach = 4;
+    constexpr std::size_t kThreads = 4;
+    using udp = asio::ip::udp;
+    std::pmr::synchronized_pool_resource memory(message_pool_options());
+    asio::io_context ctx;
+    std::atomic<std::uint32_t> complete{0}, wrong{0};
+    std::atomic<bool> listening{false};
+    bool finished = false;
+    std::unique_ptr<Listener> listener;
+
+    asio::co_spawn(ctx, [&]() -> asio::awaitable<void> {
+        TransportServices ts(ctx, MessageMemoryConfig{&memory});
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp arrivals: listen"); co_return; }
+        listener = std::move(*lr);
+        listening = true;
+        for (;;) {
+            auto ar = co_await listener->accept();
+            if (!ar)
+                break;
+            asio::co_spawn(ctx, [&, c = std::shared_ptr<Connection>(std::move(*ar))]() -> asio::awaitable<void> {
+                int id = -1;
+                for (std::uint32_t n = 0; n < kEach; ++n) {
+                    auto r = co_await c->receive();
+                    std::array<std::uint32_t, 2> d{};
+                    if (!r || r->size() != sizeof d) { ++wrong; co_return; }
+                    gather(std::as_writable_bytes(std::span(d)), *r);
+                    if (id >= 0 && d[0] != static_cast<std::uint32_t>(id)) { ++wrong; co_return; }
+                    id = static_cast<int>(d[0]);
+                }
+                ++complete;
+            }, fail_on_exception);
+        }
+    }, fail_on_exception);
+    std::vector<std::thread> threads;
+    for (std::size_t t = 0; t < kThreads; ++t)
+        threads.emplace_back([&ctx] { ctx.run_for(std::chrono::seconds(20)); });
+
+    // The clients, from a thread of their own: each sends its datagrams straight away.
+    {
+        asio::io_context client_ctx;
+        std::vector<std::unique_ptr<udp::socket>> clients;
+        while (!listening)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (std::uint32_t i = 0; i < kClients; ++i) {
+            clients.push_back(std::make_unique<udp::socket>(client_ctx, udp::endpoint(udp::v4(), 0)));
+            clients.back()->connect({asio::ip::make_address("127.0.0.1"), port});
+            for (std::uint32_t j = 0; j < kEach; ++j) {
+                const std::array<std::uint32_t, 2> d{i, j};
+                clients.back()->send(asio::buffer(d));
+            }
+            // A steady arrival, not one burst: accept() keeps up even on a slow
+            // machine (a new source it cannot take in time is dropped by design).
+            if (i % 20 == 19)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        for (int t = 0; t < 1000 && complete + wrong < kClients; ++t)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::printf("      (udp arrivals: %u of %u complete, %u wrong)\n", complete.load(), kClients, wrong.load());
+    CHECK(complete == kClients && wrong == 0,
+          "udp: sources that keep arriving each get a Connection with all their own datagrams");
+    asio::co_spawn(ctx, [&]() -> asio::awaitable<void> {
+        if (listener)
+            co_await listener->stop();
+        finished = true;
+        ctx.stop();
+    }, fail_on_exception);
+    for (auto& t : threads)
+        t.join();
+    check_finished(finished, "udp arrivals test");
+}
+
 // Several passive Connections of one Listener sending at once, from several threads,
 // on the shared socket: every datagram reaches its own peer, intact and in order.
 // Each peer acknowledges a batch before the next, so no datagram is lost to a full
 // receive buffer.
 static void test_udp_concurrent_passive_sends() {
-    constexpr std::uint16_t port = 19965;
+    constexpr std::uint16_t port = 19950;
     constexpr std::size_t kPeers = 4, kRounds = 50, kBatch = 32, kThreads = 4;
     using udp = asio::ip::udp;
+    // Several threads receive and hold Messages: a thread-safe message resource,
+    // declared first so that it outlives everything that uses it.
+    std::pmr::synchronized_pool_resource memory(message_pool_options());
     asio::io_context ctx;
     std::atomic<std::size_t> ended{0};             // senders and peers that reached their end
     std::atomic<std::size_t> errors{0};
@@ -1122,7 +1297,7 @@ static void test_udp_concurrent_passive_sends() {
     };
 
     asio::co_spawn(ctx, [&]() -> asio::awaitable<void> {
-        TransportServices ts(ctx);
+        TransportServices ts(ctx, MessageMemoryConfig{&memory});
         auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
         if (!lr) { CHECK(false, "udp concurrent sends: listen"); co_return; }
         auto listener = std::move(*lr);
@@ -1191,11 +1366,13 @@ static void test_udp_receive_before_send() {
     check_finished(finished, "udp receive before send test");
 }
 
-// A passive UDP Connection keeps the newest datagrams when its bounded queue
-// fills (drop-oldest, counted), and delivers them in order.
-static void test_udp_passive_queue_drops_oldest() {
+// A passive UDP Connection whose application does not keep up loses datagrams
+// (UDP has no flow control) and counts them; what it delivers stays in order. With a
+// socket of its own, the system drops the newest once the socket's buffer is full
+// and reports how many with the next datagram received.
+static void test_udp_passive_queue_overflow() {
     constexpr std::uint16_t port = 19964;
-    constexpr std::uint16_t kSent = 300, kBound = 256;
+    constexpr std::uint16_t kSent = 300, kMarker = 0xffff;
     asio::io_context ctx;
     bool finished = false;
     asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
@@ -1204,27 +1381,48 @@ static void test_udp_passive_queue_drops_oldest() {
         if (!lr) { CHECK(false, "udp queue: listen"); co_return; }
         auto listener = std::move(*lr);
         asio::ip::udp::socket peer(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
-        for (std::uint16_t i = 0; i < kSent; ++i) {
-            const std::uint8_t d[2] = {static_cast<std::uint8_t>(i >> 8), static_cast<std::uint8_t>(i)};
+        auto send = [&](std::uint16_t v) -> asio::awaitable<void> {
+            const std::uint8_t d[2] = {static_cast<std::uint8_t>(v >> 8), static_cast<std::uint8_t>(v)};
             co_await peer.async_send_to(asio::buffer(d), {asio::ip::make_address("127.0.0.1"), port},
                                         asio::use_awaitable);
-            if (i % 50 == 49) co_await pause(ctx, 5);   // let the listener drain the socket
+        };
+        for (std::uint16_t i = 0; i < kSent; ++i) {
+            co_await send(i);
+            if (i % 50 == 49) co_await pause(ctx, 5);   // let the listener drain its socket
         }
         co_await pause(ctx, 50);
         auto ar = co_await listener->accept();
         if (!ar) { CHECK(false, "udp queue: accept"); co_return; }
         auto* passive = dynamic_cast<PassiveUDPConnection*>(ar->get());
-        bool in_order = true;
-        for (std::uint16_t expected = kSent - kBound; expected < kSent; ++expected) {
-            auto r = co_await (*ar)->receive();
+        std::size_t delivered = 0;
+        int last = -1;
+        bool in_order = true, marker = false, marker_sent = false;
+        while (!marker) {
+            // Once the backlog is read (nothing for a while), the marker, sent after
+            // the losses, reports them.
+            using namespace asio::experimental::awaitable_operators;
+            asio::steady_timer quiet(ctx, std::chrono::milliseconds(200));
+            auto got = co_await ((*ar)->receive() || quiet.async_wait(asio::use_awaitable));
+            if (got.index() == 1) {
+                if (marker_sent) { in_order = false; break; }
+                co_await send(kMarker);
+                marker_sent = true;
+                continue;
+            }
+            auto r = std::move(std::get<0>(got));
             const auto b = r ? r->as_bytes() : std::span<const std::byte>{};
-            const std::uint16_t got = b.size() == 2
-                ? static_cast<std::uint16_t>((std::to_integer<unsigned>(b[0]) << 8) | std::to_integer<unsigned>(b[1]))
-                : 0xffff;
-            in_order = in_order && got == expected;
+            if (b.size() != 2) { in_order = false; break; }
+            const int v = (std::to_integer<int>(b[0]) << 8) | std::to_integer<int>(b[1]);
+            marker = v == kMarker;
+            if (!marker) {
+                in_order = in_order && v > last;
+                last = v;
+                ++delivered;
+            }
         }
-        CHECK(passive && passive->datagrams_dropped() == kSent - kBound && in_order,
-              "udp: a full passive queue drops the oldest datagrams, counts them, and keeps the newest in order");
+        const std::size_t dropped = passive ? passive->datagrams_dropped() : 0;
+        CHECK(passive && marker && in_order && delivered < kSent && delivered + dropped == kSent,
+              "udp: a passive connection that falls behind loses datagrams, counts them, and delivers the rest in order");
         co_await (*ar)->close();
         co_await listener->stop();
         co_await pause(ctx, 50);
@@ -1284,7 +1482,7 @@ int main() {
     test_establishment_errors();
     test_udp_echo();
     test_udp_receive_before_send();
-    test_udp_passive_queue_drops_oldest();
+    test_udp_passive_queue_overflow();
     test_udp_several_remote_endpoints();
     test_udp_connection_outlives_listener();
     test_udp_listener_stop();
@@ -1293,6 +1491,8 @@ int main() {
     test_udp_new_connection_limit();
     test_tcp_new_connection_limit();
     test_udp_concurrent_passive_sends();
+    test_udp_burst_from_many_new_sources();
+    test_udp_new_sources_keep_arriving();
 
     if (g_failures == 0) {
         std::printf("connection_test: all checks passed\n");

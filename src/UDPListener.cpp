@@ -18,6 +18,7 @@
 
 #if !defined(_WIN32)
 #include <sys/resource.h>
+#include <sys/socket.h>
 #endif
 
 namespace taps {
@@ -45,11 +46,12 @@ std::size_t connection_ceiling() {
 // UDPDemux
 // ============================================================================
 
-UDPDemux::UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool,
+UDPDemux::UDPDemux(asio::io_context& ctx, const MessageMemoryConfig& memory,
                    std::shared_ptr<NewConnectionLimit> limit)
 : socket_(ctx)
 , strand_(asio::make_strand(ctx))
-, pool_(std::move(pool))
+, memory_(memory)
+, pool_(std::make_unique<MessageBlockPool>(memory))
 , limit_(std::move(limit))
 , accept_channel_(ctx.get_executor(), 100)
 {}
@@ -61,6 +63,14 @@ Result<void> UDPDemux::start(const asio::ip::udp::endpoint& local) {
     socket_.open(local.protocol(), ec);
     if (!ec)
         socket_.set_option(asio::ip::udp::socket::reuse_address(true), ec);
+#if !defined(_WIN32)
+    // Lets each Connection bind a socket of its own to this port. Without it the
+    // Connections share this socket.
+    if (!ec) {
+        const int one = 1;
+        ::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+    }
+#endif
     if (!ec)
         socket_.bind(local, ec);
     if (!ec)
@@ -70,6 +80,9 @@ Result<void> UDPDemux::start(const asio::ip::udp::endpoint& local) {
         socket_.close(ignored);
         return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, ec));
     }
+    asio::error_code nb;
+    socket_.non_blocking(true, nb);               // for drain(); the receive loop is unaffected
+    can_drain_ = !nb;
     // The loop holds a reference until the socket closes (shut_down_if_unused()).
     asio::co_spawn(strand_, [self = shared_from_this()] { return self->receive_loop(); },
                    asio::detached);
@@ -79,6 +92,14 @@ Result<void> UDPDemux::start(const asio::ip::udp::endpoint& local) {
 asio::awaitable<void> UDPDemux::receive_loop() {
     asio::ip::udp::endpoint sender;
     for (;;) {
+        while (!backlog_.empty()) {
+            auto [from, datagram] = std::move(backlog_.front());
+            backlog_.pop_front();
+            route(from, std::move(datagram));
+            // Give up the strand in between, as a read from the socket would:
+            // accept() needs it to take the Connections this creates.
+            co_await asio::post(strand_, asio::use_awaitable);
+        }
         BlockRef block = pool_->acquire();
         if (!block) {
             // At the live-block cap: read the datagram and drop it (UDP has no flow
@@ -105,36 +126,113 @@ asio::awaitable<void> UDPDemux::receive_loop() {
             block.set_range(0, n);
             datagram->append(std::move(block));
         }
+        route(sender, std::move(datagram));
+    }
+}
 
-        std::shared_ptr<Mailbox> mailbox;
-        if (auto it = table_.find(sender); it != table_.end()) {
-            mailbox = it->second;
+void UDPDemux::route(const asio::ip::udp::endpoint& sender, std::shared_ptr<BlockChain> datagram) {
+    if (auto it = table_.find(sender); it != table_.end()) {
+        it->second.mailbox->deliver(std::move(datagram));
+        if (it->second.own_socket && it->second.delivered)
+            it->second.mailbox->count_late();
+        return;
+    }
+    if (!accepting_)
+        return;                                   // no Listener: no new Connections
+    if (table_.size() >= connection_ceiling())
+        return;                                   // full: the new source is refused
+    if (!limit_->take())
+        return;                                   // new-connection limit at zero (RFC 9622 Section 7.2)
+
+    auto mailbox = std::make_shared<Mailbox>(strand_, pool_->resource());
+    mailbox->deliver(std::move(datagram));
+    auto own = open_connected(sender);
+    if (own && can_drain_) {
+        drain(*own, sender, *mailbox);            // other sources' datagrams, from before connect()
+        drain(socket_, sender, *mailbox);         // this source's, still on the listening socket
+    }
+    // This source's datagrams already read ahead (while settling an earlier new
+    // Connection) go to it too, in the order they were read.
+    for (auto it = backlog_.begin(); it != backlog_.end();) {
+        if (it->first == sender) {
+            mailbox->deliver(std::move(it->second));
+            it = backlog_.erase(it);
         } else {
-            if (!accepting_)
-                continue;                         // no Listener: no new Connections
-            if (table_.size() >= connection_ceiling())
-                continue;                         // full: the new source is refused
-            if (!limit_->take())
-                continue;                         // new-connection limit at zero (RFC 9622 Section 7.2)
-            mailbox = std::make_shared<Mailbox>(strand_, pool_->resource());
-            table_.emplace(sender, mailbox);
-
-            // Non-blocking: if accept() is not keeping up, drop the new source
-            // rather than stall the demux for everyone.
-            auto conn = std::make_unique<PassiveUDPConnection>(shared_from_this(), sender, mailbox);
-            if (!accept_channel_.try_send(std::error_code{}, std::move(conn))) {
-                // `conn` was not taken; its destructor releases the source.
-                limit_->give_back();
-                continue;
-            }
+            ++it;
         }
-        mailbox->deliver(std::move(datagram));
+    }
+    const bool own_socket = own != nullptr;
+    auto [it, inserted] = table_.emplace(sender, Entry{mailbox, own_socket, false});
+    if (!own_socket)
+        ++shared_entries_;
+
+    // Non-blocking: if accept() is not keeping up, drop the new source rather than
+    // stall the demux for everyone.
+    auto conn = std::make_unique<PassiveUDPConnection>(shared_from_this(), sender, mailbox,
+                                                       std::move(own), memory_);
+    if (!accept_channel_.try_send(std::error_code{}, std::move(conn))) {
+        // `conn` was not taken; its destructor releases the source.
+        limit_->give_back();
+        return;
+    }
+    it->second.delivered = true;
+}
+
+std::unique_ptr<asio::ip::udp::socket>
+UDPDemux::open_connected([[maybe_unused]] const asio::ip::udp::endpoint& peer) {
+#if defined(_WIN32)
+    return nullptr;
+#else
+    auto s = std::make_unique<asio::ip::udp::socket>(socket_.get_executor());
+    asio::error_code ec;
+    s->open(local_.protocol(), ec);
+    if (ec)
+        return nullptr;
+    const int one = 1;
+    if (::setsockopt(s->native_handle(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0)
+        return nullptr;
+#if defined(SO_RXQ_OVFL)
+    // The Connection reads how many datagrams the system dropped with each one.
+    ::setsockopt(s->native_handle(), SOL_SOCKET, SO_RXQ_OVFL, &one, sizeof one);
+#endif
+    s->bind(local_, ec);
+    if (!ec)
+        s->connect(peer, ec);
+    if (!ec)
+        s->non_blocking(true, ec);
+    if (ec)
+        return nullptr;
+    return s;
+#endif
+}
+
+void UDPDemux::drain(asio::ip::udp::socket& socket, const asio::ip::udp::endpoint& peer,
+                     Mailbox& mailbox) {
+    for (;;) {
+        BlockRef block = pool_->acquire();
+        if (!block)
+            return;                               // at the cap: the rest stays queued
+        asio::ip::udp::endpoint from;
+        asio::error_code ec;
+        const std::size_t n = socket.receive_from(
+            asio::buffer(block.writable_data(), block.capacity_after_begin()), from, 0, ec);
+        if (ec)
+            return;                               // nothing more queued (or an error)
+        auto datagram = make_chain(pool_->resource());
+        if (n > 0) {
+            block.set_range(0, n);
+            datagram->append(std::move(block));
+        }
+        if (from == peer)
+            mailbox.deliver(std::move(datagram));
+        else
+            backlog_.emplace_back(from, std::move(datagram));
     }
 }
 
 void UDPDemux::shut_down_if_unused() {
-    if (accepting_ || !table_.empty())
-        return;
+    if (accepting_ || shared_entries_ != 0)
+        return;                                   // Connections with their own sockets do not need it
     asio::error_code ignored;
     socket_.close(ignored);                       // ends receive_loop()
 }
@@ -167,8 +265,10 @@ void UDPDemux::stop_accepting() {
 void UDPDemux::release(const asio::ip::udp::endpoint& source, const Mailbox* mailbox) {
     asio::post(strand_, [self = shared_from_this(), source, mailbox] {
         auto it = self->table_.find(source);
-        if (it != self->table_.end() && it->second.get() == mailbox) {
-            it->second->close();                  // a waiting receive() fails
+        if (it != self->table_.end() && it->second.mailbox.get() == mailbox) {
+            it->second.mailbox->close();          // a waiting receive() fails
+            if (!it->second.own_socket)
+                --self->shared_entries_;
             self->table_.erase(it);
         }
         self->shut_down_if_unused();
@@ -186,8 +286,7 @@ UDPListener::UDPListener(
     SecurityParameters security,
     MessageMemoryConfig memory)
 : io_context_(ctx)
-, demux_(std::make_shared<UDPDemux>(
-      ctx, std::make_unique<MessageBlockPool>(memory), new_connection_limit_))
+, demux_(std::make_shared<UDPDemux>(ctx, memory, new_connection_limit_))
 {
     local_endpoint_       = std::move(local);
     transport_properties_ = std::move(properties);

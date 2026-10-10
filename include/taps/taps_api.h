@@ -11,6 +11,7 @@
 
 #include "taps/message_framer.h"   // taps::MessageFramer (API v2), ReceiveCursor, ParseResult
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <map>
@@ -804,10 +805,14 @@ private:
 class PassiveUDPConnection : public Connection {
 public:
 
-    // Created by the UDP Listener's demultiplexer for each new source.
+    // Created by the UDP Listener's demultiplexer for each new source. `socket`, if
+    // not null, is this Connection's own, bound to the listening port and connected
+    // to `remote`; otherwise the Connection shares the listening socket.
     PassiveUDPConnection(std::shared_ptr<UDPDemux> demux, asio::ip::udp::endpoint remote,
-                         std::shared_ptr<Mailbox> mailbox);
-    ~PassiveUDPConnection();
+                         std::shared_ptr<Mailbox> mailbox,
+                         std::unique_ptr<asio::ip::udp::socket> socket,
+                         const MessageMemoryConfig& memory);
+    ~PassiveUDPConnection();  // out-of-line: block_pool_ points to a private type
 
     asio::awaitable<Result<void>> send(const Message& message) override;
     asio::awaitable<Result<Message>> receive() override;
@@ -817,9 +822,15 @@ public:
     RemoteEndpoint get_remote_endpoint() const override;
     LocalEndpoint get_local_endpoint() const override;
 
-    // Datagrams discarded (drop-oldest) because the receive ring was full while
-    // the application was not consuming fast enough. UDP has no flow control.
+    // Datagrams discarded because the application was not consuming fast enough
+    // (UDP has no flow control): by the Mailbox, which drops the oldest, and, with a
+    // socket of its own, by the system, which drops the newest when the socket's
+    // receive buffer is full (counted where the system reports it, SO_RXQ_OVFL).
     std::size_t datagrams_dropped() const noexcept;
+
+    // Datagrams that reached the listening socket after this Connection had started
+    // reading from its own socket (they are delivered all the same).
+    std::size_t datagrams_late() const noexcept;
 
     friend class UDPDemux;
 
@@ -827,9 +838,15 @@ private:
     // Removes this Connection's source from the demultiplexer, once.
     void release() noexcept;
 
+    // Reads one datagram from socket_.
+    asio::awaitable<Result<Message>> receive_own();
+
     std::shared_ptr<UDPDemux> demux_;   // shared with the Listener and its other Connections
     asio::ip::udp::endpoint remote_endpoint_;
-    std::shared_ptr<Mailbox> mailbox_;
+    std::shared_ptr<Mailbox> mailbox_;  // datagrams from before socket_ was connected
+    std::unique_ptr<asio::ip::udp::socket> socket_;    // own socket, or null
+    std::unique_ptr<MessageBlockPool> block_pool_;     // receive blocks for socket_
+    std::atomic<std::size_t> system_dropped_{0};       // last SO_RXQ_OVFL count
     bool aborted_ = false;
     bool released_ = false;
 };
@@ -899,8 +916,9 @@ public:
                         TransportProperties properties = {},
                         SecurityParameters security = {},
                         MessageMemoryConfig memory = {});
-    // Stops accepting; Connections already accepted keep working (they share the
-    // socket, which closes when the last of them goes).
+    // Stops accepting; Connections already accepted keep working (each on its own
+    // socket, or on the listening one, which then stays open until the last of them
+    // goes).
     ~UDPListener();
 
     asio::awaitable<Result<void>> listen() override;
