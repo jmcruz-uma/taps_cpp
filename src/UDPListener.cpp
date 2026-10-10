@@ -12,35 +12,32 @@
 #include <asio/redirect_error.hpp>
 #include <asio/use_awaitable.hpp>
 #include <array>
-#include <chrono>
-#include <cstdlib>
-#include <iterator>
+#include <limits>
 #include <memory>
+
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
 
 namespace taps {
 
 namespace {
-constexpr std::size_t kMaxConnections = 1024;
-constexpr auto        kIdleTimeout    = std::chrono::seconds(30);
-constexpr auto        kSweepInterval  = std::chrono::seconds(5);
 
-// Overridable for testing / tuning; falls back to the constants above.
-std::size_t env_or(const char* name, std::size_t def) {
-    if (const char* s = std::getenv(name)) {
-        const unsigned long long v = std::strtoull(s, nullptr, 10);
-        if (v != 0) return static_cast<std::size_t>(v);
-    }
-    return def;
+// The most sources a UDP Listener's table holds: as many as the process may have
+// file descriptors, read when a new source arrives (so a raised limit applies at
+// once). Each passive Connection is meant to hold a descriptor of its own; this is
+// what the process can afford, not a policy. Windows has no such limit to read.
+std::size_t connection_ceiling() {
+#if defined(_WIN32)
+    return std::size_t{1} << 16;
+#else
+    rlimit lim{};
+    if (::getrlimit(RLIMIT_NOFILE, &lim) != 0 || lim.rlim_cur == RLIM_INFINITY)
+        return std::numeric_limits<std::size_t>::max();
+    return static_cast<std::size_t>(lim.rlim_cur);
+#endif
 }
-std::size_t max_connections() { return env_or("TAPS_UDP_MAX_CONNS", kMaxConnections); }
-std::chrono::seconds idle_timeout() {
-    return std::chrono::seconds(env_or("TAPS_UDP_IDLE_SECS",
-                                       static_cast<std::size_t>(kIdleTimeout.count())));
-}
-std::chrono::seconds sweep_interval() {
-    return std::chrono::seconds(env_or("TAPS_UDP_SWEEP_SECS",
-                                       static_cast<std::size_t>(kSweepInterval.count())));
-}
+
 }  // namespace
 
 // ============================================================================
@@ -51,7 +48,6 @@ UDPDemux::UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool
 : socket_(ctx)
 , strand_(asio::make_strand(ctx))
 , pool_(std::move(pool))
-, sweep_timer_(strand_)
 , accept_channel_(ctx.get_executor(), 100)
 {}
 
@@ -71,11 +67,8 @@ Result<void> UDPDemux::start(const asio::ip::udp::endpoint& local) {
         socket_.close(ignored);
         return std::unexpected(io_error(ErrorEvent::ESTABLISHMENT_ERROR, ec));
     }
-    // Each coroutine holds a reference until the socket closes or the timer is
-    // cancelled (shut_down_if_unused()).
+    // The loop holds a reference until the socket closes (shut_down_if_unused()).
     asio::co_spawn(strand_, [self = shared_from_this()] { return self->receive_loop(); },
-                   asio::detached);
-    asio::co_spawn(strand_, [self = shared_from_this()] { return self->sweep_loop(); },
                    asio::detached);
     return Result<void>{std::in_place};
 }
@@ -110,20 +103,16 @@ asio::awaitable<void> UDPDemux::receive_loop() {
             datagram->append(std::move(block));
         }
 
-        const auto now = std::chrono::steady_clock::now();
         std::shared_ptr<Mailbox> mailbox;
-        if (auto it = index_.find(sender); it != index_.end()) {
-            it->second->last_active = now;
-            lru_.splice(lru_.begin(), lru_, it->second);     // move to most recent
-            mailbox = it->second->mailbox;
+        if (auto it = table_.find(sender); it != table_.end()) {
+            mailbox = it->second;
         } else {
             if (!accepting_)
                 continue;                         // no Listener: no new Connections
-            if (index_.size() >= max_connections() && !lru_.empty())
-                evict(std::prev(lru_.end()), Mailbox::CloseCause::displaced);
+            if (table_.size() >= connection_ceiling())
+                continue;                         // full: the new source is refused
             mailbox = std::make_shared<Mailbox>(strand_, pool_->resource());
-            lru_.push_front(Entry{sender, mailbox, now});
-            index_.emplace(sender, lru_.begin());
+            table_.emplace(sender, mailbox);
 
             // Non-blocking: if accept() is not keeping up, drop the new source
             // rather than stall the demux for everyone.
@@ -137,32 +126,11 @@ asio::awaitable<void> UDPDemux::receive_loop() {
     }
 }
 
-asio::awaitable<void> UDPDemux::sweep_loop() {
-    for (;;) {
-        sweep_timer_.expires_after(sweep_interval());
-        asio::error_code ec;
-        co_await sweep_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
-        if (ec)
-            co_return;                            // cancelled by shut_down_if_unused()
-        const auto cutoff = std::chrono::steady_clock::now() - idle_timeout();
-        while (!lru_.empty() && lru_.back().last_active < cutoff)
-            evict(std::prev(lru_.end()), Mailbox::CloseCause::idle);
-        shut_down_if_unused();
-    }
-}
-
-void UDPDemux::evict(Lru::iterator it, Mailbox::CloseCause cause) {
-    it->mailbox->close(cause);                    // a waiting receive() fails with the cause
-    index_.erase(it->source);
-    lru_.erase(it);
-}
-
 void UDPDemux::shut_down_if_unused() {
-    if (accepting_ || !index_.empty())
+    if (accepting_ || !table_.empty())
         return;
     asio::error_code ignored;
     socket_.close(ignored);                       // ends receive_loop()
-    sweep_timer_.cancel();                        // ends sweep_loop()
 }
 
 asio::awaitable<Result<std::unique_ptr<Connection>>> UDPDemux::accept() {
@@ -192,9 +160,11 @@ void UDPDemux::stop_accepting() {
 
 void UDPDemux::release(const asio::ip::udp::endpoint& source, const Mailbox* mailbox) {
     asio::post(strand_, [self = shared_from_this(), source, mailbox] {
-        auto it = self->index_.find(source);
-        if (it != self->index_.end() && it->second->mailbox.get() == mailbox)
-            self->evict(it->second, Mailbox::CloseCause::owner);
+        auto it = self->table_.find(source);
+        if (it != self->table_.end() && it->second.get() == mailbox) {
+            it->second->close();                  // a waiting receive() fails
+            self->table_.erase(it);
+        }
         self->shut_down_if_unused();
     });
 }

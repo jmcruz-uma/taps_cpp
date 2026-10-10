@@ -46,13 +46,6 @@ class Mailbox {
 public:
     using value_type = std::shared_ptr<BlockChain>;
 
-    // Why the Mailbox was closed.
-    enum class CloseCause {
-        owner,      // the connection was closed or aborted locally
-        idle,       // no traffic for longer than the listener's idle timeout
-        displaced   // evicted to make room for a new source (bounded table)
-    };
-
     Mailbox(asio::any_io_executor exec, std::pmr::memory_resource* resource,
             std::size_t capacity = 256)
         : exec_(std::move(exec))
@@ -89,15 +82,12 @@ public:
         return timer_.async_wait(asio::as_tuple(asio::use_awaitable));
     }
 
-    void close(CloseCause cause = CloseCause::owner) {
-        if (!closed_)
-            cause_ = cause;
+    void close() {
         closed_ = true;
         timer_.cancel();
     }
 
     bool closed() const noexcept { return closed_; }
-    CloseCause close_cause() const noexcept { return cause_; }
 
     std::size_t dropped() const noexcept {
         return dropped_.load(std::memory_order_relaxed);
@@ -129,7 +119,6 @@ private:
     std::size_t                   capacity_;
     std::atomic<std::size_t>      dropped_{0};
     bool                          closed_ = false;
-    CloseCause                    cause_ = CloseCause::owner;
 };
 
 } // namespace taps

@@ -5,7 +5,7 @@
 // (chain-backed) Messages, receive-pool exhaustion, a pending receive() interrupted
 // by abort(), replying after the peer's end of stream, close() with unread data or
 // a pending receive(), abort() as a reset, establishment and listen errors, UDP
-// datagram echo, UDP idle eviction, the UDP Listener's lifetime (passive
+// datagram echo, the UDP Listener's ceiling on sources, its lifetime (passive
 // Connections outlive it; stop() only stops accepting new sources), and concurrent
 // sends of several passive UDP Connections from several threads. Errors are checked as RFC 9622 event + RFC 9623 Appendix B reason.
 
@@ -28,6 +28,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <sys/resource.h>
 
 using namespace taps;
 
@@ -574,47 +576,6 @@ static void test_establishment_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// UDP: a passive connection with no traffic is evicted by the listener's idle sweep.
-// ---------------------------------------------------------------------------
-static void test_udp_idle_eviction() {
-    constexpr std::uint16_t port = 19995;
-    ::setenv("TAPS_UDP_IDLE_SECS", "1", 1);
-    ::setenv("TAPS_UDP_SWEEP_SECS", "1", 1);
-    asio::io_context ctx;
-    bool finished = false;
-    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
-        TransportServices ts(ctx);
-        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
-        if (!lr) { CHECK(false, "udp idle: listen"); co_return; }
-        auto listener = std::move(*lr);
-
-        asio::ip::udp::socket peer(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
-        const std::uint8_t one = 1;
-        co_await peer.async_send_to(asio::buffer(&one, 1),
-                                    {asio::ip::make_address("127.0.0.1"), port}, asio::use_awaitable);
-
-        auto ar = co_await listener->accept();
-        if (!ar) { CHECK(false, "udp idle: accept"); co_return; }
-        auto conn = std::move(*ar);
-        auto first = co_await conn->receive();
-        auto evicted = co_await conn->receive();   // no more traffic: the sweep evicts it
-        CHECK(first && is_error(evicted, ErrorEvent::CONNECTION_ERROR, ErrorReason::IDLE_TIMEOUT),
-              "udp idle: an idle passive connection ends with CONNECTION_ERROR / IDLE_TIMEOUT");
-        CHECK(conn->state() == ConnectionState::CLOSED, "udp idle: connection is CLOSED");
-
-        // The listener's receive loop must observe stop() before the listener goes away.
-        co_await listener->stop();
-        asio::steady_timer t(ctx, std::chrono::milliseconds(50));
-        co_await t.async_wait(asio::use_awaitable);
-        finished = true;
-    }, fail_on_exception);
-    ctx.run_for(std::chrono::seconds(10));
-    check_finished(finished, "udp idle test");
-    ::unsetenv("TAPS_UDP_IDLE_SECS");
-    ::unsetenv("TAPS_UDP_SWEEP_SECS");
-}
-
-// ---------------------------------------------------------------------------
 // End of the peer's stream and Close (RFC 9623 Section 10.1, TCP).
 // ---------------------------------------------------------------------------
 
@@ -944,6 +905,78 @@ static void test_udp_source_after_connection_destroyed() {
     check_finished(finished, "udp new connection test");
 }
 
+// ---------------------------------------------------------------------------
+// UDP: the Listener holds at most as many sources as the process may have file
+// descriptors. Beyond that a new source is refused and no existing Connection is
+// evicted; a raised limit applies at once.
+// ---------------------------------------------------------------------------
+static void test_udp_ceiling_refuses_new_sources() {
+    constexpr std::uint16_t port = 19995;
+    rlimit saved{};
+    ::getrlimit(RLIMIT_NOFILE, &saved);
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished, saved]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp ceiling: listen"); co_return; }
+        auto listener = std::move(*lr);
+        std::vector<std::unique_ptr<asio::ip::udp::socket>> peers;
+        for (int i = 0; i < 4; ++i)
+            peers.push_back(std::make_unique<asio::ip::udp::socket>(
+                ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0)));
+
+        rlimit low = saved;
+        low.rlim_cur = 3;                              // room for three sources
+        ::setrlimit(RLIMIT_NOFILE, &low);
+        std::vector<std::unique_ptr<Connection>> conns;
+        for (int i = 0; i < 3; ++i) {
+            co_await udp_send_byte(*peers[i], port, 'a');
+            auto ar = co_await listener->accept();
+            if (!ar) { ::setrlimit(RLIMIT_NOFILE, &saved); CHECK(false, "udp ceiling: accept"); co_return; }
+            (void)co_await (*ar)->receive();
+            conns.push_back(std::move(*ar));
+        }
+
+        Listener* raw = listener.get();
+        Result<std::unique_ptr<Connection>> fourth =
+            std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, "not run"});
+        bool fourth_done = false;
+        asio::co_spawn(ctx, [raw, &fourth, &fourth_done]() -> asio::awaitable<void> {
+            fourth = co_await raw->accept();
+            fourth_done = true;
+        }, fail_on_exception);
+        co_await udp_send_byte(*peers[3], port, 'x');
+        co_await pause(ctx, 200);
+        const bool refused = !fourth_done;
+
+        co_await udp_send_byte(*peers[0], port, 'b');
+        auto kept = co_await conns[0]->receive();
+        CHECK(refused && one_byte(kept, 'b'),
+              "udp: at the ceiling a new source is refused and existing connections are kept");
+
+        ::setrlimit(RLIMIT_NOFILE, &saved);
+        co_await udp_send_byte(*peers[3], port, 'y');
+        co_await pause(ctx, 200);
+        bool admitted = false;
+        if (fourth_done && fourth) {
+            auto r = co_await (*fourth)->receive();
+            admitted = one_byte(r, 'y');
+            co_await (*fourth)->close();
+        }
+        CHECK(admitted, "udp: once the descriptor limit is raised, a new source gets a connection");
+
+        for (auto& c : conns)
+            co_await c->close();
+        co_await listener->stop();
+        co_await pause(ctx, 50);
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(10));
+    ::setrlimit(RLIMIT_NOFILE, &saved);
+    check_finished(finished, "udp ceiling test");
+}
+
 // Several passive Connections of one Listener sending at once, from several threads,
 // on the shared socket: every datagram reaches its own peer, intact and in order.
 // Each peer acknowledges a batch before the next, so no datagram is lost to a full
@@ -1151,13 +1184,13 @@ int main() {
     test_abort_resets();
     test_establishment_errors();
     test_udp_echo();
-    test_udp_idle_eviction();
     test_udp_receive_before_send();
     test_udp_passive_queue_drops_oldest();
     test_udp_several_remote_endpoints();
     test_udp_connection_outlives_listener();
     test_udp_listener_stop();
     test_udp_source_after_connection_destroyed();
+    test_udp_ceiling_refuses_new_sources();
     test_udp_concurrent_passive_sends();
 
     if (g_failures == 0) {

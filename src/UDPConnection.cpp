@@ -105,16 +105,6 @@ PassiveUDPConnection::receive() {
         co_await mailbox_->wait();
     }
     state_ = ConnectionState::CLOSED;
-    switch (mailbox_->close_cause()) {
-        case Mailbox::CloseCause::idle:
-            co_return std::unexpected(TAPSError(ErrorEvent::CONNECTION_ERROR, ErrorReason::IDLE_TIMEOUT,
-                                                "no traffic from the peer within the idle timeout"));
-        case Mailbox::CloseCause::displaced:
-            co_return std::unexpected(TAPSError(ErrorEvent::CONNECTION_ERROR, ErrorReason::RESOURCE_EXHAUSTED,
-                                                "evicted: the listener's connection table is full"));
-        case Mailbox::CloseCause::owner:
-            break;
-    }
     co_return std::unexpected(cancelled(ErrorEvent::RECEIVE_ERROR, aborted_));
 }
 

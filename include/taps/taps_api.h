@@ -83,7 +83,6 @@ enum class ErrorReason {
     LOCAL_ENDPOINT_UNAVAILABLE,  // the Local Endpoint is in use on this system
     INVALID_STATE,               // the operation is not valid in the current state
     RESOURCE_EXHAUSTED,          // memory or descriptors for the operation ran out
-    IDLE_TIMEOUT,                // the Connection was ended after staying idle
     INTERNAL_ERROR               // unexpected failure inside the implementation
 };
 
