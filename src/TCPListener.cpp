@@ -1,5 +1,6 @@
 
 #include "taps/taps_api.h"
+#include "new_connection_limit.h"
 #include "transport/io_error.h"
 #include "secure_acceptor.h"
 #include "security/security_provider.h"
@@ -112,7 +113,7 @@ TCPListener::TCPListener(asio::io_context& ctx, LocalEndpoint local,
                         TransportProperties properties,
                         SecurityParameters security,
                         MessageMemoryConfig memory)
-        : io_context_(ctx), acceptor_(ctx), memory_(memory){
+        : io_context_(ctx), acceptor_(ctx), limit_changed_(ctx.get_executor(), 1), memory_(memory){
             local_endpoint_ = std::move(local);
             transport_properties_ = std::move(properties);
             security_parameters_ = std::move(security);
@@ -191,9 +192,22 @@ asio::awaitable<Result<void>> TCPListener::listen() {
                                                 "Not listening"});
         }
         
+        // RFC 9622 Section 7.2: with the new-connection limit at zero, no Connection
+        // is delivered (the system keeps incoming ones queued) until it is raised.
+        while (!new_connection_limit_->take()) {
+            auto [ec] = co_await limit_changed_.async_receive(asio::as_tuple(asio::use_awaitable));
+            if (ec || !is_listening_)
+                co_return std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR,
+                                                    ErrorReason::INVALID_STATE, "Listener stopped"});
+        }
+
         if (secure_) {
             auto secure = secure_;                        // the Listener may go while this waits
-            co_return co_await secure->accept();
+            auto limit = new_connection_limit_;
+            auto result = co_await secure->accept();
+            if (!result)
+                limit->give_back();                       // nothing was delivered
+            co_return result;
         }
 
         // RFC 9622 Section 7.2: a Listener's EstablishmentError concerns the Listener
@@ -205,6 +219,8 @@ asio::awaitable<Result<void>> TCPListener::listen() {
             auto socket = co_await acceptor_.async_accept(asio::redirect_error(asio::use_awaitable, ec));
             if (ec == asio::error::connection_aborted)
                 continue;
+            if (ec)
+                new_connection_limit_->give_back();       // nothing was delivered
             if (ec == asio::error::operation_aborted)
                 co_return std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR,
                                                     ErrorReason::INVALID_STATE, "Listener stopped"});
@@ -224,11 +240,13 @@ asio::awaitable<Result<void>> TCPListener::listen() {
         if (secure_) {
             secure_->stop();
             is_listening_ = false;
+            limit_changed_.try_send(asio::error_code{});  // an accept() waiting for the limit ends
             co_return std::expected<void, TAPSError>{std::in_place};
         }
         try {
             acceptor_.close();
             is_listening_ = false;
+            limit_changed_.try_send(asio::error_code{});  // an accept() waiting for the limit ends
             co_return std::expected<void, TAPSError>{std::in_place};
             
         } catch (const std::system_error& e) {
@@ -237,6 +255,10 @@ asio::awaitable<Result<void>> TCPListener::listen() {
         }
     }
     
+    void TCPListener::new_connection_limit_changed() {
+        limit_changed_.try_send(asio::error_code{});
+    }
+
     bool TCPListener::is_listening() const noexcept { 
         return is_listening_; 
     }

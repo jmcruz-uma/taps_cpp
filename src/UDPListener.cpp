@@ -1,6 +1,7 @@
 #include "taps/taps_api.h"
 #include "taps/mailbox.h"
 #include "udp_demux.h"
+#include "new_connection_limit.h"
 #include "buffer/block_chain.h"
 #include "buffer/message_block_pool.h"
 #include "transport/io_error.h"
@@ -44,10 +45,12 @@ std::size_t connection_ceiling() {
 // UDPDemux
 // ============================================================================
 
-UDPDemux::UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool)
+UDPDemux::UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool,
+                   std::shared_ptr<NewConnectionLimit> limit)
 : socket_(ctx)
 , strand_(asio::make_strand(ctx))
 , pool_(std::move(pool))
+, limit_(std::move(limit))
 , accept_channel_(ctx.get_executor(), 100)
 {}
 
@@ -111,6 +114,8 @@ asio::awaitable<void> UDPDemux::receive_loop() {
                 continue;                         // no Listener: no new Connections
             if (table_.size() >= connection_ceiling())
                 continue;                         // full: the new source is refused
+            if (!limit_->take())
+                continue;                         // new-connection limit at zero (RFC 9622 Section 7.2)
             mailbox = std::make_shared<Mailbox>(strand_, pool_->resource());
             table_.emplace(sender, mailbox);
 
@@ -119,6 +124,7 @@ asio::awaitable<void> UDPDemux::receive_loop() {
             auto conn = std::make_unique<PassiveUDPConnection>(shared_from_this(), sender, mailbox);
             if (!accept_channel_.try_send(std::error_code{}, std::move(conn))) {
                 // `conn` was not taken; its destructor releases the source.
+                limit_->give_back();
                 continue;
             }
         }
@@ -181,7 +187,7 @@ UDPListener::UDPListener(
     MessageMemoryConfig memory)
 : io_context_(ctx)
 , demux_(std::make_shared<UDPDemux>(
-      ctx, std::make_unique<MessageBlockPool>(memory)))
+      ctx, std::make_unique<MessageBlockPool>(memory), new_connection_limit_))
 {
     local_endpoint_       = std::move(local);
     transport_properties_ = std::move(properties);

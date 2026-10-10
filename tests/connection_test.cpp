@@ -5,7 +5,8 @@
 // (chain-backed) Messages, receive-pool exhaustion, a pending receive() interrupted
 // by abort(), replying after the peer's end of stream, close() with unread data or
 // a pending receive(), abort() as a reset, establishment and listen errors, UDP
-// datagram echo, the UDP Listener's ceiling on sources, its lifetime (passive
+// datagram echo, the UDP Listener's ceiling on sources, the new-connection
+// limit (UDP and TCP), the UDP Listener's lifetime (passive
 // Connections outlive it; stop() only stops accepting new sources), and concurrent
 // sends of several passive UDP Connections from several threads. Errors are checked as RFC 9622 event + RFC 9623 Appendix B reason.
 
@@ -977,6 +978,104 @@ static void test_udp_ceiling_refuses_new_sources() {
     check_finished(finished, "udp ceiling test");
 }
 
+// ---------------------------------------------------------------------------
+// The new-connection limit (RFC 9622 Section 7.2, SetNewConnectionLimit): each
+// delivered Connection takes one; at zero none is delivered until it is raised.
+// ---------------------------------------------------------------------------
+
+// Runs `raw->accept()` in the background; `done` turns true when it completes.
+static void accept_in_background(asio::io_context& ctx, Listener* raw,
+                                 Result<std::unique_ptr<Connection>>& out, bool& done) {
+    asio::co_spawn(ctx, [raw, &out, &done]() -> asio::awaitable<void> {
+        out = co_await raw->accept();
+        done = true;
+    }, fail_on_exception);
+}
+
+static Result<std::unique_ptr<Connection>> not_run() {
+    return std::unexpected(TAPSError{ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INTERNAL_ERROR, "not run"});
+}
+
+static void test_udp_new_connection_limit() {
+    constexpr std::uint16_t port = 19966;
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto lr = co_await ts.listen(LocalEndpoint{"127.0.0.1", port}, udp_props());
+        if (!lr) { CHECK(false, "udp limit: listen"); co_return; }
+        auto listener = std::move(*lr);
+        listener->set_new_connection_limit(1);
+        asio::ip::udp::socket a(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+        asio::ip::udp::socket b(ctx, asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+
+        co_await udp_send_byte(a, port, 'a');
+        auto first = co_await listener->accept();
+        auto second = not_run();
+        bool second_done = false;
+        accept_in_background(ctx, listener.get(), second, second_done);
+        co_await udp_send_byte(b, port, 'b');
+        co_await pause(ctx, 200);
+        CHECK(first && !second_done, "udp limit: with a limit of one, a second source gets no connection");
+
+        listener->set_new_connection_limit(unlimited_connections);
+        co_await udp_send_byte(b, port, 'c');
+        co_await pause(ctx, 200);
+        bool admitted = false;
+        if (second_done && second) {
+            auto r = co_await (*second)->receive();
+            admitted = one_byte(r, 'c');
+            co_await (*second)->close();
+        }
+        CHECK(admitted, "udp limit: once the limit is lifted, the refused source gets a connection");
+        if (first)
+            co_await (*first)->close();
+        co_await listener->stop();
+        co_await pause(ctx, 50);
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(10));
+    check_finished(finished, "udp new connection limit test");
+}
+
+static void test_tcp_new_connection_limit() {
+    constexpr std::uint16_t port = 19967;
+    asio::io_context ctx;
+    bool finished = false;
+    asio::co_spawn(ctx, [&ctx, &finished]() -> asio::awaitable<void> {
+        TransportServices ts(ctx);
+        auto listener = co_await listen_tcp(ts, port);
+        if (!listener) { CHECK(false, "tcp limit: listen"); co_return; }
+        listener->set_new_connection_limit(0);
+
+        auto first = not_run();
+        bool first_done = false;
+        accept_in_background(ctx, listener.get(), first, first_done);
+        auto c1 = co_await connect_tcp(ts, port);          // the system queues it
+        co_await pause(ctx, 200);
+        const bool held = c1 && !first_done;
+        listener->set_new_connection_limit(1);
+        co_await pause(ctx, 200);
+        CHECK(held && first_done && first,
+              "tcp limit: at zero no connection is delivered; raising the limit delivers the queued one");
+
+        auto second = not_run();
+        bool second_done = false;
+        accept_in_background(ctx, listener.get(), second, second_done);
+        auto c2 = co_await connect_tcp(ts, port);
+        co_await pause(ctx, 200);
+        const bool held_again = c2 && !second_done;
+        co_await listener->stop();
+        co_await pause(ctx, 50);
+        CHECK(held_again && second_done &&
+                  is_error(second, ErrorEvent::ESTABLISHMENT_ERROR, ErrorReason::INVALID_STATE),
+              "tcp limit: the delivery used up the limit; stop() ends an accept() waiting for it");
+        finished = true;
+    }, fail_on_exception);
+    ctx.run_for(std::chrono::seconds(10));
+    check_finished(finished, "tcp new connection limit test");
+}
+
 // Several passive Connections of one Listener sending at once, from several threads,
 // on the shared socket: every datagram reaches its own peer, intact and in order.
 // Each peer acknowledges a batch before the next, so no datagram is lost to a full
@@ -1191,6 +1290,8 @@ int main() {
     test_udp_listener_stop();
     test_udp_source_after_connection_destroyed();
     test_udp_ceiling_refuses_new_sources();
+    test_udp_new_connection_limit();
+    test_tcp_new_connection_limit();
     test_udp_concurrent_passive_sends();
 
     if (g_failures == 0) {

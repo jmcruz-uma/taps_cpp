@@ -18,6 +18,7 @@
 namespace taps {
 
 class MessageBlockPool;
+class NewConnectionLimit;
 
 // ============================================================================
 // UDPDemux (private)
@@ -45,7 +46,8 @@ class MessageBlockPool;
 // ============================================================================
 class UDPDemux : public std::enable_shared_from_this<UDPDemux> {
 public:
-    UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool);
+    UDPDemux(asio::io_context& ctx, std::unique_ptr<MessageBlockPool> pool,
+             std::shared_ptr<NewConnectionLimit> limit);
     ~UDPDemux();
 
     // Binds the socket and starts the receive loop.
@@ -83,6 +85,7 @@ private:
     asio::ip::udp::endpoint local_;
     asio::strand<asio::io_context::executor_type> strand_;
     std::unique_ptr<MessageBlockPool> pool_;   // one block per datagram
+    std::shared_ptr<NewConnectionLimit> limit_; // the Listener's (RFC 9622 Section 7.2)
     asio::experimental::channel<void(std::error_code, std::unique_ptr<PassiveUDPConnection>)>
         accept_channel_;
 

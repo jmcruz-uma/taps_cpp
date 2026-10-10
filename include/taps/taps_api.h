@@ -7,6 +7,7 @@
 #include <asio/ip/udp.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/experimental/channel.hpp>
+#include <asio/experimental/concurrent_channel.hpp>
 
 #include "taps/message_framer.h"   // taps::MessageFramer (API v2), ReceiveCursor, ParseResult
 
@@ -20,6 +21,7 @@
 #include <functional>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <system_error>
 #include <tuple>
@@ -50,6 +52,7 @@ class RemoteEndpoint;
 class Mailbox;
 class UDPDemux;
 class SecureAcceptor;
+class NewConnectionLimit;
 
 // ============================================================================
 // Error Handling
@@ -582,15 +585,30 @@ protected:
     std::unique_ptr<MessageFramer> framer_;
 };
 
+// RFC 9622 Section 7.2, SetNewConnectionLimit: by default, no limit.
+inline constexpr std::size_t unlimited_connections = std::numeric_limits<std::size_t>::max();
+
 class Listener {
 public:
-    virtual ~Listener() = default;
+    Listener();
+    virtual ~Listener();
     
     virtual asio::awaitable<Result<void>> listen() = 0;
     virtual asio::awaitable<Result<std::unique_ptr<Connection>>> accept() = 0;
     virtual asio::awaitable<Result<void>> stop() = 0;
 
+    // At most `limit` more Connections are delivered: each delivery takes one, and
+    // at zero none is until the limit is raised (RFC 9622 Section 7.2). By default
+    // unlimited_connections. May be called from any thread.
+    void set_new_connection_limit(std::size_t limit);
+
 protected:
+    // Called after the limit is set, so that a delivery waiting for it can go on.
+    virtual void new_connection_limit_changed() {}
+
+    // Shared with whatever delivers this Listener's Connections (it may outlive it).
+    std::shared_ptr<NewConnectionLimit> new_connection_limit_;
+
     LocalEndpoint local_endpoint_;
     TransportProperties transport_properties_;
     SecurityParameters security_parameters_;
@@ -862,8 +880,13 @@ public:
     LocalEndpoint get_local_endpoint() const;
 
 private:
+    void new_connection_limit_changed() override;
+
     asio::io_context& io_context_;
     asio::ip::tcp::acceptor acceptor_;
+    // Wakes an accept() waiting for the new-connection limit to be raised (or for
+    // stop()). Thread-safe, holds one wake-up, so none is lost.
+    asio::experimental::concurrent_channel<void(asio::error_code)> limit_changed_;
     // Given to each TCPConnection accept() creates.
     MessageMemoryConfig memory_;
     // With security: accepts and secures connections in parallel (owns the acceptor).
