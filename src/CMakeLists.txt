@@ -1,10 +1,12 @@
 # Recopilar todos los archivos fuente de TAPS
-file(GLOB_RECURSE TAPS_SOURCES
+# CONFIGURE_DEPENDS: a file added later is picked up by the next build, without
+# re-running cmake by hand.
+file(GLOB_RECURSE TAPS_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/*.cc")
 
 # Recopilar todos los headers privados (si los hay en src/)
-file(GLOB_RECURSE TAPS_PRIVATE_HEADERS
+file(GLOB_RECURSE TAPS_PRIVATE_HEADERS CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/*.h")
 
 # The OpenSSL-backed TLS sources (security/tls_*.cpp) only build with TAPS_WITH_TLS;
